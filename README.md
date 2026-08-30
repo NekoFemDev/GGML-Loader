@@ -33,6 +33,10 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
       overwritten -- but only if the output passes a basic sanity check (non-trivial length,
       balanced braces/parens/brackets), since these are small raw-completion models with no
       diff/code-edit fine-tuning and can truncate or hallucinate on a full-file rewrite.
+      Extraction is robust to common small-model output patterns: it takes the LAST non-empty
+      ``` fence (so an "improved" rewrite that comes after a "simple" draft is preferred), and
+      also recognizes a `===== BEGIN FILE =====` / `===== END FILE =====` answer format that
+      some models produce after seeing those markers in the prompt.
   - `ggml-loader chat <model.gguf> [--system "text"] [--backend cpu|vulkan]` -- interactive
     multi-turn chat using the model's actual instruct format (phi3-style, ChatML, or
     llama3's header-id format, picked automatically), conversation history threaded through the

@@ -68,20 +68,108 @@ static bool looks_like_plausible_code(const std::string & generated, size_t orig
     return curly == 0 && paren == 0 && square == 0;
 }
 
-// small local models routinely ignore "no code fences" and wrap the rewrite in a ```lang ... ```
-// block anyway (sometimes followed by rambling repeated ``` tokens once past the real content,
-// having missed eos). Strip a leading fence and cut at the *first* matching close, discarding
-// anything after it, rather than trusting the model's own stop point.
-static std::string strip_code_fence(const std::string & s) {
-    size_t start = s.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos || s.compare(start, 3, "```") != 0) return s;
-    size_t nl = s.find('\n', start);
-    if (nl == std::string::npos) return s;
-    size_t close = s.find("```", nl + 1);
-    std::string body = (close == std::string::npos) ? s.substr(nl + 1) : s.substr(nl + 1, close - (nl + 1));
-    // trim a single trailing newline left by the fence line, if present
-    if (!body.empty() && body.back() == '\n') body.pop_back();
-    return body;
+// Extracts the model's intended file rewrite from its output, handling the common small-model
+// failure modes:
+//   1. Model wraps the rewrite in a ```lang ... ``` fence.
+//   2. Model first writes narrative text ("Sure! Here's the improved version:") or a
+//      simplified draft, *then* the actual rewrite, with or without a fence.
+//   3. Model produces multiple fence-wrapped blocks (a "simple" version and an "improved"
+//      one); we want the LAST non-empty one since that's the canonical answer.
+//   4. Model drifts after the rewrite and emits trailing ``` tokens (with no body between them)
+//      because it missed eos; we must not let those trailing bare fences become our "last
+//      fence pair" and clobber the real content.
+//   5. Model copies the prompt's own BEGIN/END-FILE delimiter and writes its answer between
+//      its own pair of those markers (observed: small models see the prompt as a "fill in
+//      between these markers" template and dutifully produce their own). Recognize this and
+//      take the LAST ===== BEGIN FILE ===== / ===== END FILE ===== pair's body.
+//
+// Strategy: try the strategies in order of specificity (most specific first).
+//   a) If the output contains ===== END FILE =====, take everything between the last
+//      ===== END FILE ===== and the matching ===== BEGIN FILE ===== just before it (case 5).
+//   b) Else find the LAST non-empty ``` fence pair (cases 1, 3, 4).
+//   c) Else fall back to "rewrite starts after the first blank line following prose" (case 2).
+//   d) Final fallback: return input unchanged; brace-balance sanity check catches the worst.
+static std::string extract_edit_rewrite(const std::string & s) {
+    auto is_blank = [](const std::string & body) {
+        return body.find_first_not_of(" \t\r\n") == std::string::npos;
+    };
+
+    // (a) ===== BEGIN FILE ===== / ===== END FILE ===== pattern (case 5). Walk all marker
+    // positions, find the LAST "===== END FILE =====" and pair it with the nearest
+    // "===== BEGIN FILE =====" to its left.
+    auto find_marker = [&s](const std::string & marker, size_t start) -> size_t {
+        return s.find(marker, start);
+    };
+    size_t scan_from = 0;
+    size_t last_end = std::string::npos;
+    while (true) {
+        size_t p = find_marker("===== END FILE =====", scan_from);
+        if (p == std::string::npos) break;
+        last_end = p;
+        scan_from = p + 1; // advance past this match to look for another
+    }
+    if (last_end != std::string::npos) {
+        // find the nearest ===== BEGIN FILE ===== to the left of last_end
+        size_t begin = s.rfind("===== BEGIN FILE =====", last_end);
+        if (begin != std::string::npos) {
+            size_t body_start = s.find('\n', begin);
+            body_start = (body_start == std::string::npos) ? begin : body_start + 1;
+            // body is [body_start, last_end)
+            std::string body = s.substr(body_start, last_end - body_start);
+            if (!body.empty() && body.back() == '\n') body.pop_back();
+            if (!is_blank(body)) return body;
+        }
+    }
+
+    // (b) Last non-empty ``` fence pair (cases 1, 3, 4)
+    std::vector<size_t> fences;
+    for (size_t i = 0; i + 2 < s.size(); ) {
+        if (s[i] == '`' && s[i+1] == '`' && s[i+2] == '`') {
+            fences.push_back(i);
+            i += 3;
+        } else {
+            i++;
+        }
+    }
+    // Try every (open, close) pair, rightmost-pairs first, and return the first one with a
+    // non-empty body. Greedy rightward pairing: for each close, the nearest open to its left.
+    for (size_t k = fences.size(); k-- > 0; ) {
+        size_t close = fences[k];
+        size_t open = std::string::npos;
+        for (size_t j = k; j-- > 0; ) { open = fences[j]; break; }
+        if (open == std::string::npos) continue;
+        size_t body_start = s.find('\n', open);
+        if (body_start == std::string::npos || body_start >= close) {
+            body_start = open + 3;
+        } else {
+            body_start += 1;
+        }
+        std::string body = s.substr(body_start, close - body_start);
+        if (!body.empty() && body.back() == '\n') body.pop_back();
+        if (!is_blank(body)) return body;
+    }
+
+    // (c) "rewrite starts after the first blank line following prose" fallback (case 2)
+    bool saw_prose = false;
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t line_end = s.find('\n', i);
+        std::string line = s.substr(i, (line_end == std::string::npos) ? std::string::npos : line_end - i);
+        if (line.find_first_not_of(" \t\r") == std::string::npos) {
+            if (saw_prose) {
+                size_t rewrite_start = (line_end == std::string::npos) ? s.size() : line_end + 1;
+                while (rewrite_start < s.size() && s[rewrite_start] == '\n') rewrite_start++;
+                std::string body = s.substr(rewrite_start);
+                if (!is_blank(body)) return body;
+                break;
+            }
+        } else {
+            saw_prose = true;
+        }
+        if (line_end == std::string::npos) break;
+        i = line_end + 1;
+    }
+    return s; // give up -- return as-is
 }
 
 int cmd_run(int argc, char ** argv) {
@@ -144,9 +232,19 @@ int cmd_run(int argc, char ** argv) {
             return 1;
         }
         std::string instruction = prompt.empty() ? "Improve this file." : prompt;
-        prompt = "Here is the file `" + edit_file + "`:\n```\n" + edit_original_content +
-                 "\n```\n\n" + instruction +
-                 "\n\nOutput the complete updated file and nothing else, no explanation, no code fences.\n";
+        // Prompt shape: short instruction, file in a plain-text delimiter (NOT a ``` fence --
+        // putting ``` in the prompt confuses small models into treating the *whole prompt* as
+        // one giant code block to "complete" inside, observed as a looped trivial rewrite under
+        // greedy decoding), short instruction. Narrative/extra-fence output is then handled
+        // robustly in extract_edit_rewrite() rather than forbidden in the prompt, because
+        // verbose rule lists themselves trigger the failure mode (qwen2.5-coder-3b and qwen3-8b
+        // both degenerate into repeating an invented "Do not change the file's ..." rule
+        // forever when given a long bulleted instruction set).
+        prompt = instruction + "\n\n"
+                 "File `" + edit_file + "`:\n"
+                 "===== BEGIN FILE =====\n" + edit_original_content + "\n===== END FILE =====\n\n"
+                 "Reply with the complete updated file in a single fenced code block (three backticks "
+                 "on the open and close lines), no other text.";
         if (!n_set) {
             // rough token estimate (~3 bytes/token) plus headroom for growth (e.g. added debug code)
             int64_t est = (int64_t) (edit_original_content.size() / 3) + 256;
@@ -245,7 +343,13 @@ int cmd_run(int argc, char ** argv) {
 
     if (!edit_file.empty()) {
         std::vector<int32_t> generated_tokens(all_tokens.begin() + prompt_tokens.size(), all_tokens.end());
-        std::string generated = strip_code_fence(vc.detok(generated_tokens));
+        std::string raw = vc.detok(generated_tokens);
+        std::string generated = extract_edit_rewrite(raw);
+        // Show what was extracted vs the raw model output -- this is the difference between what
+        // the model literally said and what we'll actually write to disk, so misbehaving prompts
+        // (where extraction picks the wrong block) are easy to diagnose.
+        fprintf(stderr, "\n[extract: kept %zu/%zu chars of model output]\n",
+                generated.size(), raw.size());
 
         if (!edit_on) {
             fprintf(stderr, "\n[--edit-file dry run: not writing '%s', pass --edit-on to apply]\n",
