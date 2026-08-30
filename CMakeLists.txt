@@ -27,6 +27,7 @@ add_subdirectory(third_party/ggml)
 add_executable(ggml-loader
     src/main.cpp
     src/model.cpp
+    src/ollama_model.cpp
     src/cmd_inspect.cpp
     src/cmd_run.cpp
     src/cmd_chat.cpp

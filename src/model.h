@@ -342,6 +342,16 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
                                  const std::vector<int32_t> & new_tokens, int64_t n_vocab,
                                  ssm_state * ss = nullptr);
 
+// Same contract as forward_step() (logits for the last token only), but for a batch of tokens
+// being prefilled all at once (as opposed to forward_step()'s single-decode-step callers, which
+// should keep calling forward_step() directly). When `use_chunking` is true (pass this for the
+// Vulkan backend only -- see the long comment at this function's definition in model.cpp), splits
+// the batch into <=8-token forward_step() calls if that avoids a ggml-vulkan shader-selection
+// performance cliff for medium-small batches; otherwise identical to one forward_step() call.
+std::vector<float> prefill(const model & m, const hparams & hp, kv_cache & kv, decode_session & ds,
+                            ggml_backend_t backend, int64_t n_past, const std::vector<int32_t> & tokens,
+                            int64_t n_vocab, bool use_chunking, ssm_state * ss = nullptr);
+
 int32_t argmax(const std::vector<float> & logits);
 
 // Sampling: temp<=0 is greedy (== argmax, deterministic) -- this is the default everywhere

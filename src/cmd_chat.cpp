@@ -5,6 +5,7 @@
 // encodes/prefills the newest user message, not the whole conversation.
 #include "commands.h"
 #include "model.h"
+#include "ollama_model.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -70,6 +71,7 @@ int cmd_chat(int argc, char ** argv) {
     }
     sampler smp = init_sampler(sp);
 
+    model_path = resolve_model_ref(model_path);
     ggml_backend_t backend = init_backend(backend_name, 8);
 
     struct gguf_context * gctx = nullptr;
@@ -123,7 +125,10 @@ int cmd_chat(int argc, char ** argv) {
         }
 
         auto t0 = std::chrono::steady_clock::now();
-        std::vector<float> logits = forward_step(m, hp, kv, ds, backend, n_past, pending, n_vocab, &ss);
+        // chunked on Vulkan -- see prefill()'s comment in model.cpp -- to dodge a mid-size-batch
+        // shader-selection cliff that a short chat turn (very often 9-30 tokens) lands in constantly
+        std::vector<float> logits = prefill(m, hp, kv, ds, backend, n_past, pending, n_vocab,
+                                             backend_name == "vulkan", &ss);
         n_past += (int64_t) pending.size();
         auto t1 = std::chrono::steady_clock::now();
         double prefill_s = std::chrono::duration<double>(t1 - t0).count();

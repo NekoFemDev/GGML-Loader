@@ -1,5 +1,6 @@
 // `ggml-loader inspect <model.gguf>`: dump GGUF metadata and tensor list.
 #include "commands.h"
+#include "ollama_model.h"
 
 #include "ggml.h"
 #include "gguf.h"
@@ -43,20 +44,20 @@ int cmd_inspect(int argc, char ** argv) {
         return 1;
     }
 
-    const char * path = argv[1];
+    std::string path = resolve_model_ref(argv[1]);
 
     struct gguf_init_params params = {
         /*.no_alloc =*/ true,
         /*.ctx      =*/ nullptr,
     };
 
-    gguf_context * ctx = gguf_init_from_file(path, params);
+    gguf_context * ctx = gguf_init_from_file(path.c_str(), params);
     if (!ctx) {
-        fprintf(stderr, "error: failed to load '%s' as GGUF\n", path);
+        fprintf(stderr, "error: failed to load '%s' as GGUF\n", path.c_str());
         return 1;
     }
 
-    printf("file:      %s\n", path);
+    printf("file:      %s\n", path.c_str());
     printf("version:   %u\n", gguf_get_version(ctx));
     printf("alignment: %zu\n", gguf_get_alignment(ctx));
 

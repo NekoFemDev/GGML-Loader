@@ -5,6 +5,7 @@
 // don't leak into the reported stats.
 #include "commands.h"
 #include "model.h"
+#include "ollama_model.h"
 
 #include "ggml-backend.h"
 #include "gguf.h"
@@ -97,6 +98,7 @@ int cmd_bench(int argc, char ** argv) {
         return 1;
     }
 
+    model_path = resolve_model_ref(model_path);
     ggml_backend_t backend = init_backend(backend_name, 8);
 
     struct gguf_context * gctx = nullptr;

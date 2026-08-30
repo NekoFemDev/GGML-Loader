@@ -1289,6 +1289,50 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
     return last_logits;
 }
 
+// Prefills `tokens` (splitting into multiple forward_step() calls if that's faster -- see below),
+// returning the same thing a single forward_step() call would: logits for the last token only.
+//
+// Why this exists: ggml-vulkan picks between three very different mul_mat strategies based on
+// the batch size (the number of new tokens, "n"): n<=8 uses a dedicated, per-n-specialized
+// dequant+dot mat-vec pipeline; n>~32 uses its "medium"/"large" tiled GEMM shader; in between (the
+// exact cutoffs are internal to ggml-vulkan, empirically ~9..32 here) it falls back to the "small"
+// tiled GEMM shader, whose fixed per-dispatch costs (workgroup-tile loading of src0 etc.) don't
+// amortize over so few columns. Measured on this project's actual target (Mali-G615, no matrix
+// cores, so no coopmat2 -- just the int-dot-product path), that middle zone is not a mild
+// slowdown but a 3-5x cliff below *both* neighboring zones (e.g. one real run: pp8 7.1 tok/s,
+// pp16 2.3 tok/s, pp32 4.5 tok/s, pp64 12.0 tok/s) -- and ordinary chat turns land in exactly that
+// zone constantly (a short user message is very often 9-30 tokens). Splitting such a prefill into
+// <=8-token forward_step() calls (each individually landing in the fast mat-vec zone, sequentially
+// appended to the same KV cache -- forward_step() already only returns the last token's logits
+// regardless of batch size, so this changes nothing observable except speed) measured at ~7 tok/s
+// sustained, i.e. the fast zone's own throughput, instead of the 2-3 tok/s the single bad-zone
+// dispatch would have gotten. Left as a single call for n<=8 (already the fast path) and n>32
+// (already the fast tiled-GEMM path) -- chunking those would only add dispatch overhead for no
+// benefit, and for large n would actively regress (16x 8-token calls sustain ~7 tok/s, well below
+// one big call's 10-12 tok/s).
+//
+// Vulkan-only: `use_chunking` should be false for the CPU backend, whose mul_mat threading scales
+// close to linearly with batch size (no equivalent shader-tile cliff), so splitting would just add
+// per-chunk overhead for nothing.
+std::vector<float> prefill(const model & m, const hparams & hp, kv_cache & kv, decode_session & ds,
+                            ggml_backend_t backend, int64_t n_past, const std::vector<int32_t> & tokens,
+                            int64_t n_vocab, bool use_chunking, ssm_state * ss) {
+    constexpr size_t kFastChunk = 8; // ggml-vulkan's mul_mat_vec_max_cols -- see block comment above
+    constexpr size_t kBadZoneMax = 32; // beyond this, a single dispatch is already in the fast tiled-GEMM zone
+
+    if (!use_chunking || tokens.size() <= kFastChunk || tokens.size() > kBadZoneMax) {
+        return forward_step(m, hp, kv, ds, backend, n_past, tokens, n_vocab, ss);
+    }
+
+    std::vector<float> last_logits;
+    for (size_t off = 0; off < tokens.size(); off += kFastChunk) {
+        size_t n = std::min(kFastChunk, tokens.size() - off);
+        std::vector<int32_t> chunk(tokens.begin() + off, tokens.begin() + off + n);
+        last_logits = forward_step(m, hp, kv, ds, backend, n_past + (int64_t) off, chunk, n_vocab, ss);
+    }
+    return last_logits;
+}
+
 int32_t argmax(const std::vector<float> & logits) {
     int32_t best = 0;
     float best_v = logits[0];

@@ -26,6 +26,13 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
   - `ggml-loader inspect <model.gguf>` -- dump GGUF metadata and tensor list.
   - `ggml-loader run <model.gguf> -p "prompt" -n N [--backend cpu|vulkan]` -- one-shot raw
     completion (no chat template) with separate prefill/decode timing.
+    - `--edit-file <path> [--edit-on]`: wraps `<path>`'s contents plus the `-p` instruction into
+      a whole-file-rewrite prompt (e.g. `-p "Add debugging" --edit-file main.c --edit-on`).
+      Without `--edit-on` it's a dry run (prints the rewrite, touches nothing). With
+      `--edit-on`, the original is first backed up to `<path>.original`, then `<path>` is
+      overwritten -- but only if the output passes a basic sanity check (non-trivial length,
+      balanced braces/parens/brackets), since these are small raw-completion models with no
+      diff/code-edit fine-tuning and can truncate or hallucinate on a full-file rewrite.
   - `ggml-loader chat <model.gguf> [--system "text"] [--backend cpu|vulkan]` -- interactive
     multi-turn chat using the model's actual instruct format (phi3-style, ChatML, or
     llama3's header-id format, picked automatically), conversation history threaded through the
@@ -36,6 +43,13 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
 
 Verified against Phi-4-mini-instruct, Qwen2.5-Coder-7B, Qwen3-0.6B, and Llama-3.1-8B-Instruct,
 all Q4_K_M/Q8_0 quantized.
+
+`<model.gguf>` above also accepts an Ollama model reference (e.g. `qwen2.5-coder:7b-instruct-q4_K_M`)
+for anything already pulled with `ollama pull <name>` -- it's resolved to the underlying blob under
+`~/.ollama/models` (or `$OLLAMA_MODELS`) via the pull's manifest, since that blob is byte-identical
+GGUF this loader already reads directly, no re-export/copy needed. Falls straight through to the
+normal "failed to load" error if the argument is neither an existing file nor a resolvable Ollama
+name.
 
 ### SDXL / image diffusion -- beta, CPU-only, not the project's focus
 
@@ -116,18 +130,31 @@ cmake -S . -B build
 cmake --build build --target ggml-loader -j$(nproc)
 ```
 
-Two small local patches are applied to the vendored `third_party/ggml` (uncommitted, in the
-working tree, not upstream) to work around a Termux `shaderc` bug that otherwise fails the
-Vulkan shader build (`shaderc: internal error: ... Invalid capability operand`) on
-`coopmat2`/`USE_OCP_FP4` shaders -- see the comments at the patched sites in
-`third_party/ggml/src/ggml-vulkan/` for details. These shader variants aren't relevant to Mali
-(no matrix cores) so disabling them costs nothing on this hardware.
+Three small local patches are applied to the vendored `third_party/ggml` (uncommitted, in the
+working tree, not upstream):
+
+- Two work around a Termux `shaderc` bug that otherwise fails the Vulkan shader build
+  (`shaderc: internal error: ... Invalid capability operand`) on `coopmat2`/`USE_OCP_FP4`
+  shaders -- see the comments at the patched sites in `third_party/ggml/src/ggml-vulkan/` for
+  details. These shader variants aren't relevant to Mali (no matrix cores) so disabling them
+  costs nothing on this hardware.
+- One fixes a real heap-buffer-overread in the CPU backend's SVE (128-bit vector length)
+  `ggml_vec_dot_q6_K_q8_K` (`third_party/ggml/src/ggml-cpu/arch/arm/quants.c`): it read 32 bytes
+  of a 16-byte `block_q6_K.scales` field via a deinterleaving `svld2_s64` load. The extra bytes
+  were always discarded before use (so results were never wrong), but the read itself segfaults
+  whenever a q6_K tensor's last block happens to end near an unmapped page -- reproduced with a
+  real Ollama-pulled `qwen2.5-coder:7b-instruct-q4_K_M` on `--backend cpu` (this device's SVE is
+  128-bit). Fixed with a correctly-sized 16-byte load split into its low/high halves instead;
+  verified bit-for-bit identical output against `--backend vulkan` (unaffected by the bug) and
+  against the other already-working models before/after the patch.
 
 ## Usage
 
 ```sh
 ./build/ggml-loader inspect model.gguf
 ./build/ggml-loader run model.gguf -p "The capital of France is" -n 24 --backend vulkan
+./build/ggml-loader run model.gguf -p "Add debugging" --edit-file main.c --edit-on
+./build/ggml-loader run qwen2.5-coder:7b-instruct-q4_K_M -p "The capital of France is" --backend vulkan
 ./build/ggml-loader chat model.gguf --backend vulkan
 ./build/ggml-loader bench model.gguf -p 128 -n 64 -r 5 --backend vulkan
 ```
