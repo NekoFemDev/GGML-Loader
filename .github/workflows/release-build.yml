@@ -16,6 +16,11 @@ on:
         description: "Release tag to upload assets into (blank = latest release)"
         required: false
         type: string
+      windows:
+        description: "Also build the Windows artifact (installs the full Vulkan SDK; ~30 min runner time)"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -62,6 +67,9 @@ jobs:
         run: gh release upload "${{ steps.rel.outputs.tag }}" ggml-loader-linux-x86_64.tar.gz --clobber
 
   windows-x86_64:
+    # manual-only: the Vulkan SDK install makes this expensive in runner minutes -- it runs
+    # solely on workflow_dispatch with windows=true, never on release publish
+    if: github.event_name == 'workflow_dispatch' && inputs.windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
