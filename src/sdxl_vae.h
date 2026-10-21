@@ -13,6 +13,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
+#include <vector>
+
 #include <vector>
 
 struct vae_resnet_block {

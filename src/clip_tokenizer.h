@@ -9,6 +9,7 @@
 // clip_merges_data.h and identical across every SD1.x/SDXL checkpoint.
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>

@@ -3,6 +3,8 @@
 
 #include "ggml-alloc.h"
 
+#include <vector>
+
 #include <cstdio>
 #include <limits>
 

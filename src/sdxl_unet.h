@@ -19,6 +19,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <cstdint>
+#include <vector>
+
 #include <vector>
 
 struct unet_resblock {

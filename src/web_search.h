@@ -12,6 +12,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <cstdint>
+#include <string>
 
 struct vocab; // model.h -- only needed by search_fit_to_tokens()
 

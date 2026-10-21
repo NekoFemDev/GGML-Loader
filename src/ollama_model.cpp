@@ -1,5 +1,7 @@
 #include "ollama_model.h"
 
+#include <cstddef>
+
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
