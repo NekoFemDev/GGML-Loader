@@ -70,7 +70,7 @@ jobs:
 
       # the runner image has no Vulkan SDK preinstalled -- install it (sets VULKAN_SDK,
       # provides glslc for ggml's build-time shader compilation)
-      - uses: humbletim/install-vulkan-sdk@v1.1.1
+      - uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.313.0
 
