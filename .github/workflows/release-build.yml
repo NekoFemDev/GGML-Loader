@@ -31,7 +31,7 @@ jobs:
       - name: Install build deps (cmake, ninja, Vulkan headers, glslc for shader compilation)
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends cmake ninja-build libvulkan-dev glslc glslang-tools
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libvulkan-dev glslc glslang-tools spirv-headers spirv-tools
 
       - name: Configure (static ggml, Vulkan ON)
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
@@ -68,7 +68,12 @@ jobs:
         with:
           submodules: recursive
 
-      # windows-latest ships the Vulkan SDK (VULKAN_SDK is set); ggml's cmake picks it up
+      # the runner image has no Vulkan SDK preinstalled -- install it (sets VULKAN_SDK,
+      # provides glslc for ggml's build-time shader compilation)
+      - uses: humbletim/install-vulkan-sdk@v1.1.1
+        with:
+          version: 1.4.313.0
+
       - name: Configure (static ggml, Vulkan ON)
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 
