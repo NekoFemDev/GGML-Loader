@@ -1,0 +1,103 @@
+# Builds the Linux x86_64 and Windows x86_64 ggml-loader binaries and attaches them
+# to the GitHub release. Fires automatically when a release is published; can also be
+# run manually (workflow_dispatch, "tag" input = the release to upload into, default:
+# the latest release).
+#
+# The Termux (Android aarch64) artifact is built on-device and uploaded manually --
+# there is no Android/Termux runner.
+name: release-build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to upload assets into (blank = latest release)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  linux-x86_64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build deps (cmake, ninja, Vulkan headers, glslc for shader compilation)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends cmake ninja-build libvulkan-dev glslc glslang-tools
+
+      - name: Configure (static ggml, Vulkan ON)
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build
+        run: cmake --build build -j"$(nproc)"
+
+      - name: Package
+        run: |
+          V=$(git describe --tags --always 2>/dev/null || echo dev)
+          tar -czf "ggml-loader-linux-x86_64.tar.gz" -C build ggml-loader -C .. install_ggml_loader.sh
+
+      - name: Resolve release tag
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            T=$(gh release view --json tagName -q .tagName)
+            echo "tag=$T" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload asset
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.rel.outputs.tag }}" ggml-loader-linux-x86_64.tar.gz --clobber
+
+  windows-x86_64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # windows-latest ships the Vulkan SDK (VULKAN_SDK is set); ggml's cmake picks it up
+      - name: Configure (static ggml, Vulkan ON)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build/Release/ggml-loader.exe dist/
+          Copy-Item install_ggml_loader.sh dist/
+          Compress-Archive -Path dist/* -DestinationPath ggml-loader-windows-x86_64.zip -Force
+
+      - name: Resolve release tag
+        id: rel
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -n "${{ inputs.tag }}" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            T=$(gh release view --json tagName -q .tagName)
+            echo "tag=$T" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.rel.outputs.tag }}" ggml-loader-windows-x86_64.zip --clobber
