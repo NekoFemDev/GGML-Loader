@@ -68,23 +68,22 @@ jobs:
         with:
           submodules: recursive
 
-      # the runner image has no Vulkan SDK preinstalled -- install it (sets VULKAN_SDK,
-      # provides glslc for ggml's build-time shader compilation)
-      - uses: humbletim/install-vulkan-sdk@v1.2
-        with:
-          version: 1.4.313.0
-
-      - name: Configure (static ggml, Vulkan ON)
+      # the runner image has no Vulkan SDK preinstalled. The 7z unpack of the NSIS
+      # installer only yields the Bin\ tools (no headers/import libs), so run the
+      # official installer silently instead: /S installs the full tree to
+      # C:\VulkanSDK\<version> (Bin/Include/Lib -- the layout CMake's FindVulkan knows).
+      - name: Install Vulkan SDK (silent)
         shell: pwsh
         run: |
-          # the 7z-unpacked SDK layout isn't guaranteed (Bin/Lib/Include vs nesting) --
-          # locate the two pieces CMake's FindVulkan needs and hand them over explicitly
-          $lib = Get-ChildItem -Recurse -Filter vulkan-1.lib $env:VULKAN_SDK | Select-Object -First 1
-          $inc = Get-ChildItem -Recurse -Filter vulkan.h $env:VULKAN_SDK | Select-Object -First 1
-          if (-not $lib -or -not $inc) { Get-ChildItem $env:VULKAN_SDK; exit 1 }
-          $incdir = Split-Path (Split-Path $inc.FullName -Parent) -Parent
-          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF `
-            -DVulkan_LIBRARY="$($lib.FullName)" -DVulkan_INCLUDE_DIR="$incdir"
+          $ver = "1.4.313.0"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$ver/windows/vulkan_sdk.exe" -OutFile vulkan_sdk.exe
+          Start-Process -Wait -FilePath .\vulkan_sdk.exe -ArgumentList "/S"
+          if (-not (Test-Path "C:\VulkanSDK\$ver\Lib\vulkan-1.lib")) { Get-ChildItem C:\VulkanSDK; exit 1 }
+          echo "VULKAN_SDK=C:\VulkanSDK\$ver" >> $env:GITHUB_ENV
+          echo "C:\VulkanSDK\$ver\Bin" >> $env:GITHUB_PATH
+
+      - name: Configure (static ggml, Vulkan ON)
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
 
       - name: Build
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
