@@ -13,15 +13,22 @@
 // (separate QKV with bias, separate gate/up FFN, plain full RoPE), qwen3 (like qwen2 but no QKV
 // bias, adds per-head QK-Norm before RoPE, and attention width can differ from n_embd/n_head --
 // see n_embd_head), llama (like qwen3's flags minus QK-Norm: separate QKV, no bias, separate
-// gate/up FFN, plain full RoPE). Each of the 4 has its own chat template (see append_chat_turn's
-// switch); llama's is "<|start_header_id|>role<|end_header_id|>\n\ntext<|eot_id|>", distinct from
-// both phi3's and ChatML. Adding another architecture means extending load_hparams/load_model
-// and, if its chat template differs from all existing ones, append_chat_turn()/friends.
+// gate/up FFN, plain full RoPE), nemotron_h (hybrid attn/SSM/FFN blocks with Mamba2), qwen35
+// (hybrid attention/Gated-DeltaNet mixers), and dory (looped nGPT hybrid: attention/MLP blocks,
+// L2 normalization everywhere, per-loop KV cache -- see dory.h; its graph/weights/cache are
+// delegated to the dory module rather than the shared layer machinery below). Each has its own
+// chat template (see append_chat_turn's switch); llama's is
+// "<|start_header_id|>role<|end_header_id|>\n\ntext<|eot_id|>", distinct from both phi3's and
+// ChatML (dory and the qwen family are ChatML, with dory adding its think-block handling in
+// append_generation_prompt). Adding another architecture means extending
+// load_hparams/load_model and, if its chat template differs from all existing ones,
+// append_chat_turn()/friends.
 #pragma once
 
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "gguf.h"
+#include "dory.h"
 
 #include <array>
 #include <cstdint>
@@ -30,11 +37,10 @@
 #include <unordered_map>
 #include <vector>
 
-// KV cache size: n_ctx_max positions, F16, across all layers. 4096 keeps the cache a bounded,
-// known size (~a few hundred MiB to ~1 GiB depending on the model's head/layer count) and is
-// within the range phi3's "short" LongRoPE factors are valid for (the only range this loader
-// implements).
-constexpr int64_t N_CTX_MAX = 4096;
+// Fallback KV-cache context size, used only when automatic sizing can't read the system's
+// available memory (/proc/meminfo missing/unparseable). Normally every subcommand sizes its KV
+// cache at startup from the RAM actually free after the weights are loaded -- see auto_n_ctx().
+constexpr int64_t N_CTX_DEFAULT = 4096;
 
 enum class arch_t {
     PHI3,
@@ -43,6 +49,7 @@ enum class arch_t {
     LLAMA,
     NEMOTRON_H,
     QWEN35,
+    DORY,
 };
 
 // nemotron_h only: which mixer a block uses. Derived from two per-layer gguf arrays
@@ -65,6 +72,7 @@ struct hparams {
                              // explicit and can differ), so this is read from that key when
                              // present rather than always derived.
     int64_t n_layer;
+    int64_t n_ctx_train;    // trained context length (`{arch}.context_length` gguf key); 0 if absent
     int64_t n_ff;
     int64_t n_rot;          // rope dimensions to rotate (== n_embd_head for full rotary)
     bool    rope_neox;      // true: NeoX-style (split-half) rotation, used by phi3/qwen2/qwen3.
@@ -145,6 +153,11 @@ struct hparams {
     // model regardless of architecture (confirmed present on both qwen35 and nemotron_h's actual
     // templates), not hardcoded per arch_t.
     bool supports_thinking = false;
+
+    // dory only. The dory module owns this architecture's parameters (block topology, layer
+    // pattern, rope profiles, nGPT constants); the generic scalar fields above are populated
+    // from the same keys so shared code paths (printing, per-token sizing) keep working.
+    struct dory_hparams dory;
 };
 
 hparams load_hparams(const gguf_context * ctx);
@@ -192,6 +205,14 @@ void append_chat_turn(const hparams & hp, const vocab & vc, std::vector<int32_t>
 // of the flag.
 void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<int32_t> & out,
                                bool enable_thinking = true);
+
+// True when append_generation_prompt() (for this model + enable_thinking) leaves the assistant
+// turn *inside* an open think block: nemotron_h's template emits the opening tag itself when
+// thinking is enabled (verified against this checkpoint's jinja), so the first generated tokens
+// are reasoning and a render-side filter must start in thinking state (see think_filter.h).
+// qwen3-style models instead generate their own opening tag, so this returns false for them.
+// Must stay in lockstep with append_generation_prompt()'s per-arch branches.
+bool generation_prompt_opens_think(const hparams & hp, bool enable_thinking);
 
 // The token id that ends a turn in this model's chat template (phi3: "<|end|>"; qwen2: "<|im_end|>").
 int32_t turn_end_token(const hparams & hp, const vocab & vc);
@@ -255,6 +276,10 @@ struct model {
     struct ggml_tensor * output_norm;
     struct ggml_tensor * rope_factors = nullptr; // phi3 LongRoPE only; nullptr => plain RoPE
     std::vector<layer_weights> layers;
+
+    // dory only: the module binds this architecture's weights itself (attention/MLP block split,
+    // per-channel scales) and owns its graph; `layers` above stays empty for this arch.
+    struct dory_model dory;
 };
 
 model load_model(struct ggml_context * wctx, const hparams & hp);
@@ -284,18 +309,48 @@ weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
 // vulkan is requested but this build/device doesn't have it. n_threads only affects "cpu".
 ggml_backend_t init_backend(const std::string & name, int n_threads);
 
-// persistent KV cache: one F16 [head_dim, n_head_kv, N_CTX_MAX] tensor per layer, per K/V. For
+// persistent KV cache: one F16 [head_dim, n_head_kv, n_ctx] tensor per layer, per K/V, where
+// n_ctx is chosen by the caller at startup (auto_n_ctx() or an explicit override). For
 // nemotron_h (mixed layer kinds), every layer still gets a slot -- wasteful for its SSM/FFN-kind
-// layers (no attention there at all) but those slots are simply never written/read, and the waste
-// is negligible next to the model weights themselves; simpler than a sparse per-kind allocation.
+// layers (no attention there at all) but those slots are sized minimally and simply never
+// written/read; simpler than a sparse per-kind allocation. For dory the cache is delegated to
+// the dory module instead (see the `dory` member below).
 struct kv_cache {
     struct ggml_context * ctx = nullptr;
     ggml_backend_buffer_t buffer = nullptr;
     std::vector<struct ggml_tensor *> k;
     std::vector<struct ggml_tensor *> v;
+
+    // dory only: ring caches with per-loop slots live in the dory module (one ring per
+    // attention block; sliding blocks sized by the window, global blocks by n_ctx). The
+    // `k`/`v` vectors above stay empty for this arch; `ctx`/`buffer` still own the storage.
+    struct dory_kv_cache dory;
 };
 
-kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend);
+kv_cache init_kv_cache(const model & m, const hparams & hp, ggml_backend_t backend, int64_t n_ctx);
+
+// Bytes the KV cache will occupy at `n_ctx` positions, mirroring init_kv_cache's exact per-layer
+// sizing (so the two must stay in lockstep) -- auto_n_ctx() divides a memory budget by this to
+// turn it into a token count. For dory this delegates to the module's sizing: sliding rings are
+// context-independent, so the cost is affine in n_ctx (base + per-token) and auto_n_ctx() solves
+// that instead of dividing by a per-token constant.
+size_t kv_cache_bytes(const model & m, const hparams & hp, int64_t n_ctx);
+
+// Bytes init_ssm_state() will allocate for this model's recurrent state (nemotron_h / qwen35);
+// 0 for every other arch. Context-independent -- the recurrent state doesn't grow with n_ctx.
+size_t ssm_state_bytes(const hparams & hp);
+
+// Automatic KV-cache context sizing. Reads MemAvailable from /proc/meminfo -- call it AFTER the
+// weights are loaded, so the model's own footprint is already subtracted by the kernel -- then:
+//   budget = (MemAvailable - fixed reserve) * keep-fraction - recurrent state,
+//   n_ctx  = budget / KV-bytes-per-token, rounded down to a multiple of 64,
+// and finally clamps to the model's trained context length (phi3-with-LongRoPE additionally to
+// its original_context_length -- the only range this loader's rope factors implement). The fixed
+// reserve + keep-fraction are the margin for compute buffers, driver/allocator fragmentation and
+// everything else running on the phone; deliberately conservative, since Android's LMK doesn't
+// give a process a second warning. Prints one line with the whole calculation. Falls back to
+// N_CTX_DEFAULT when /proc/meminfo can't be read.
+int64_t auto_n_ctx(const model & m, const hparams & hp, size_t weights_bytes);
 
 // nemotron_h's Mamba2 recurrent state -- NOT position-indexed like kv_cache. Each SSM-kind
 // layer gets a small fixed-size running accumulator (does not grow with context length) that
@@ -329,7 +384,7 @@ struct decode_session {
                                   // not to regress this project's existing lead over llama.cpp.
 };
 
-decode_session init_decode_session(ggml_backend_t backend, bool use_flash_attn = false);
+decode_session init_decode_session(ggml_backend_t backend, const hparams & hp, bool use_flash_attn = false);
 void free_decode_session(decode_session & ds);
 
 // Runs one forward pass for `new_tokens`, appending them to the KV cache at [n_past, n_past +

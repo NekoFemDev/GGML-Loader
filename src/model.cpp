@@ -80,9 +80,10 @@ hparams load_hparams(const gguf_context * ctx) {
     else if (h.arch_name == "llama")      h.arch = arch_t::LLAMA;
     else if (h.arch_name == "nemotron_h") h.arch = arch_t::NEMOTRON_H;
     else if (h.arch_name == "qwen35")     h.arch = arch_t::QWEN35;
+    else if (h.arch_name == "dory")       h.arch = arch_t::DORY;
     else {
         fprintf(stderr, "error: unsupported architecture '%s' "
-                         "(supported: phi3, qwen2, qwen3, llama, nemotron_h, qwen35)\n", h.arch_name.c_str());
+                         "(supported: phi3, qwen2, qwen3, llama, nemotron_h, qwen35, dory)\n", h.arch_name.c_str());
         exit(1);
     }
 
@@ -91,7 +92,12 @@ hparams load_hparams(const gguf_context * ctx) {
     h.n_embd  = kv_int(ctx, pfx("embedding_length").c_str());
     h.n_head  = kv_int(ctx, pfx("attention.head_count").c_str());
     h.n_layer = kv_int(ctx, pfx("block_count").c_str());
-    h.rms_eps = (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str());
+    h.n_ctx_train = kv_int(ctx, pfx("context_length").c_str()); // 0 if the model doesn't declare one
+    // dory has no normalization *weights* at all (every norm in its graph is weightless L2), so
+    // the key is absent there; every other supported arch always carries it
+    h.rms_eps = gguf_find_key(ctx, pfx("attention.layer_norm_rms_epsilon").c_str()) >= 0
+                    ? (float) kv_float(ctx, pfx("attention.layer_norm_rms_epsilon").c_str())
+                    : 0.0f;
 
     if (h.arch == arch_t::NEMOTRON_H) {
         // no rope.freq_base key at all in this arch's gguf (see hparams::no_rope) -- every other
@@ -163,6 +169,27 @@ hparams load_hparams(const gguf_context * ctx) {
                             // 3 * dn_n_head * dn_head_dim exactly (3*16*128)
             h.dn_d_conv   = kv_int(ctx, pfx("ssm.conv_kernel").c_str());
         }
+    }
+
+    if (h.arch == arch_t::DORY) {
+        // the dory module parses this architecture's own keys (block topology, layer pattern,
+        // rope profiles, nGPT constants). The generic reads above already cover the shared
+        // scalars, but the copy below keeps every field the dory_* entry points consume
+        // explicitly sourced from the module's own parse.
+        if (!dory_load_hparams(&h.dory, ctx)) {
+            exit(1); // dory_load_hparams already printed the reason
+        }
+        h.n_embd         = h.dory.n_embd;
+        h.n_head         = h.dory.n_head;
+        h.n_head_kv      = h.dory.n_head_kv;
+        h.n_ff           = h.dory.n_ff;
+        h.n_layer        = h.dory.block_count; // physical blocks; the loop count is the module's business
+        h.n_ctx_train    = h.dory.n_ctx_train;
+        h.n_embd_head    = h.dory.n_embd_head;
+        h.n_rot          = h.dory.n_rot;
+        h.rope_neox      = h.dory.rope_neox;
+        h.rope_freq_base = h.dory.rope_freq_base;
+        h.n_ctx_orig     = h.dory.n_ctx_train;
     }
 
     // not every tokenizer has a BOS token at all (qwen35: no bos_token_id key, and
@@ -448,13 +475,39 @@ void append_generation_prompt(const hparams & hp, const vocab & vc, std::vector<
             break;
     }
     if (hp.supports_thinking && !enable_thinking) {
-        // forces the model to skip reasoning -- matches how these models' own templates handle
-        // enable_thinking=false (confirmed against qwen35's and nemotron_h's actual jinja)
-        append_special_or_text(vc, out, "<think>");
-        append_encoded(vc, out, "\n\n");
-        append_special_or_text(vc, out, "</think>");
-        append_encoded(vc, out, "\n\n");
+        if (hp.arch == arch_t::DORY) {
+            // dory's template forces the skip with an immediately-closed empty block and no
+            // separators at all: the assistant header followed directly by the empty think pair
+            // checkpoint's jinja)
+            append_special_or_text(vc, out, "<thi" "nk>");
+            append_special_or_text(vc, out, "</thi" "nk>");
+        } else {
+            // forces the model to skip reasoning -- matches how these models' own templates handle
+            // enable_thinking=false (confirmed against qwen35's and nemotron_h's actual jinja)
+            append_special_or_text(vc, out, "<thi" "nk>");
+            append_encoded(vc, out, "\n\n");
+            append_special_or_text(vc, out, "</thi" "nk>");
+            append_encoded(vc, out, "\n\n");
+        }
+    } else if ((hp.arch == arch_t::NEMOTRON_H || hp.arch == arch_t::DORY) &&
+               hp.supports_thinking && enable_thinking) {
+        // nemotron_h's and dory's templates open the think block as part of the generation
+        // prompt itself (verified byte-exact against their jinja: '<|im_start|>assistant\n'
+        // followed by the opening tag and a newline); the model then emits only the closing tag.
+        // Without this, the reasoning stream has no opening marker at all and no render-side
+        // filter can tell it apart from the answer. qwen3-style templates instead have the model
+        // generate its own opening tag -- see generation_prompt_opens_think(), which must stay
+        // in lockstep with this branch.
+        append_special_or_text(vc, out, "<thi" "nk>");
+        append_encoded(vc, out, "\n");
     }
+}
+
+bool generation_prompt_opens_think(const hparams & hp, bool enable_thinking) {
+    // lockstep with append_generation_prompt(): exactly the nemotron_h/dory + thinking-enabled
+    // case ends its prompt inside an open think block
+    return hp.supports_thinking && enable_thinking &&
+           (hp.arch == arch_t::NEMOTRON_H || hp.arch == arch_t::DORY);
 }
 
 int32_t turn_end_token(const hparams & hp, const vocab & vc) {
@@ -480,6 +533,18 @@ static struct ggml_tensor * must_get(struct ggml_context * ctx, const std::strin
 
 model load_model(struct ggml_context * wctx, const hparams & hp) {
     model m;
+
+    if (hp.arch == arch_t::DORY) {
+        // Dory carries no output_norm tensor (the nGPT residual update is the last
+        // normalization in the graph), and its weight layout -- attention/MLP blocks, the
+        // per-channel scale tensors -- is entirely the dory module's business.
+        dory_load_model(&m.dory, &hp.dory, wctx);
+        // mirror the two fields generic command code reads (e.g. n_vocab from token_embd)
+        m.token_embd = m.dory.token_embd;
+        m.output     = m.dory.output != nullptr ? m.dory.output : m.dory.token_embd;
+        return m;
+    }
+
     m.token_embd  = must_get(wctx, "token_embd.weight");
     m.output_norm = must_get(wctx, "output_norm.weight");
     // tied vs untied output varies by model *size* within an architecture (small variants often
@@ -619,6 +684,18 @@ weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
         return false;
     };
 
+    // dory ships BF16 tensors; ggml-vulkan has no GGML_OP_CAST and (on devices without
+    // VK_KHR_shader_bfloat16) no BF16 mul_mat pipeline, which forces a per-step full-tensor
+    // dequant of the 671 MiB lm head into prealloc_x. Convert once at load: 2-D weights
+    // (token_embd/output) -> F16, 1-D per-channel scales -> F32. Same byte count for the
+    // big tensors; dory_f32() then never emits a cast.
+    bool convert_bf16 = false;
+    {
+        const int64_t arch_id = gguf_find_key(gctx, "general.architecture");
+        convert_bf16 = arch_id >= 0 &&
+                       strcmp(gguf_get_val_str(gctx, arch_id), "dory") == 0;
+    }
+
     // meta_ctx (no_alloc) holds descriptors for every tensor in the file; ggml has no API to strip
     // unwanted ones out of it, and ggml_backend_alloc_ctx_tensors() always allocates for the whole
     // context. So build a second, smaller context containing only the tensors we actually want,
@@ -640,6 +717,17 @@ weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
         if (!wanted(name)) continue;
         struct ggml_tensor * src = ggml_get_tensor(meta_ctx, name);
         struct ggml_tensor * t = ggml_dup_tensor(wctx, src);
+        if (convert_bf16 && src->type == GGML_TYPE_BF16) {
+            const bool is_1d = src->ne[1] == 1 && src->ne[2] == 1 && src->ne[3] == 1;
+            t->type = is_1d ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            // ggml_dup_tensor() copies the BF16 strides (2-byte elements); refresh them for the
+            // new element size -- otherwise ggml_nbytes() sizes the backend buffer at half the
+            // needed size and the elementwise kernels read the tensor with the wrong layout.
+            t->nb[0] = ggml_type_size(t->type);
+            t->nb[1] = t->nb[0] * t->ne[0];
+            t->nb[2] = t->nb[1] * t->ne[1];
+            t->nb[3] = t->nb[2] * t->ne[2];
+        }
         ggml_set_name(t, name);
     }
 
@@ -658,18 +746,35 @@ weights_store load_weights_filtered(const char * path, ggml_backend_t backend,
     }
     size_t data_base = gguf_get_data_offset(gctx);
     std::vector<uint8_t> buf;
+    std::vector<uint8_t> cbuf;
     for (int64_t i = 0; i < n_tensors; i++) {
         const char * name = gguf_get_tensor_name(gctx, i);
         if (!wanted(name)) continue;
+        struct ggml_tensor * src = ggml_get_tensor(meta_ctx, name);
         struct ggml_tensor * t = ggml_get_tensor(wctx, name);
-        size_t size = ggml_nbytes(t);
-        size_t offset = data_base + gguf_get_tensor_offset(gctx, i);
-        buf.resize(size);
-        if (fseek(f, (long) offset, SEEK_SET) != 0 || fread(buf.data(), 1, size, f) != size) {
+        const size_t file_size = ggml_nbytes(src); // bytes in the FILE (t may differ now)
+        const size_t offset = data_base + gguf_get_tensor_offset(gctx, i);
+        buf.resize(file_size);
+        if (fseek(f, (long) offset, SEEK_SET) != 0 || fread(buf.data(), 1, file_size, f) != file_size) {
             fprintf(stderr, "error: failed to read tensor '%s' from '%s'\n", name, path);
             exit(1);
         }
-        ggml_backend_tensor_set(t, buf.data(), 0, size);
+        if (t->type == src->type) {
+            ggml_backend_tensor_set(t, buf.data(), 0, file_size);
+            continue;
+        }
+        const int64_t n = ggml_nelements(src);
+        const ggml_bf16_t * in = (const ggml_bf16_t *) buf.data();
+        if (t->type == GGML_TYPE_F16) {
+            cbuf.resize(n * sizeof(ggml_fp16_t));
+            ggml_fp16_t * out = (ggml_fp16_t *) cbuf.data();
+            for (int64_t j = 0; j < n; j++) out[j] = ggml_fp32_to_fp16(ggml_bf16_to_fp32(in[j]));
+        } else { // GGML_TYPE_F32 (1-D scales)
+            cbuf.resize(n * sizeof(float));
+            float * out = (float *) cbuf.data();
+            for (int64_t j = 0; j < n; j++) out[j] = ggml_bf16_to_fp32(in[j]);
+        }
+        ggml_backend_tensor_set(t, cbuf.data(), 0, ggml_nbytes(t));
     }
     fclose(f);
 
@@ -685,6 +790,10 @@ weights_store load_weights(const char * path, ggml_backend_t backend, struct ggu
 ggml_backend_t init_backend(const std::string & name, int n_threads) {
     if (name == "cpu") {
         ggml_backend_t backend = ggml_backend_cpu_init();
+        if (!backend) {
+            fprintf(stderr, "error: failed to initialize the cpu backend\n");
+            exit(1);
+        }
         ggml_backend_cpu_set_n_threads(backend, n_threads);
         return backend;
     }
@@ -696,7 +805,12 @@ ggml_backend_t init_backend(const std::string & name, int n_threads) {
         char desc[256];
         ggml_backend_vk_get_device_description(0, desc, sizeof(desc));
         fprintf(stderr, "vulkan device 0: %s\n", desc);
-        return ggml_backend_vk_init(0);
+        ggml_backend_t backend = ggml_backend_vk_init(0);
+        if (!backend) {
+            fprintf(stderr, "error: failed to initialize the vulkan backend (device 0)\n");
+            exit(1);
+        }
+        return backend;
     }
     fprintf(stderr, "error: unknown backend '%s' (expected cpu or vulkan)\n", name.c_str());
     exit(1);
@@ -704,9 +818,27 @@ ggml_backend_t init_backend(const std::string & name, int n_threads) {
 
 // ---- persistent KV cache ----
 
-kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
+kv_cache init_kv_cache(const model & m, const hparams & hp, ggml_backend_t backend, int64_t n_ctx) {
     kv_cache kv;
     const int64_t head_dim = hp.n_embd_head;
+
+    if (hp.arch == arch_t::DORY) {
+        // Dory's cache is a set of per-block F16 rings with per-loop slots (sliding blocks sized
+        // by the window, global blocks by n_ctx). This loader uses the module's last-loop mode:
+        // all recurrent loops alias one ring per block, so the cache does not grow with
+        // num_loops -- the memory-saving variant the architecture explicitly supports.
+        size_t buf_size = ggml_tensor_overhead() * (size_t)(hp.n_layer * 2 + 8);
+        struct ggml_init_params ip = { buf_size, nullptr, /*.no_alloc =*/ true };
+        kv.ctx = ggml_init(ip);
+        dory_kv_cache_init(&kv.dory, &m.dory, kv.ctx, DORY_KV_LAST_LOOP, (uint32_t) n_ctx);
+        kv.buffer = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
+        if (!kv.buffer) {
+            fprintf(stderr, "error: failed to allocate dory KV cache (%.0f MiB requested)\n",
+                    (double) kv_cache_bytes(m, hp, n_ctx) / (1024.0 * 1024.0));
+            exit(1);
+        }
+        return kv;
+    }
 
     size_t buf_size = ggml_tensor_overhead() * (size_t)(hp.n_layer * 2 + 8);
     struct ggml_init_params ip = { buf_size, nullptr, /*.no_alloc =*/ true };
@@ -720,17 +852,36 @@ kv_cache init_kv_cache(const hparams & hp, ggml_backend_t backend) {
         int64_t n_head_kv = hp.arch == arch_t::NEMOTRON_H
                                  ? std::max<int64_t>(1, hp.n_head_kv_layer[il])
                                  : hp.n_head_kv;
-        kv.k[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, N_CTX_MAX);
-        kv.v[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, N_CTX_MAX);
+        kv.k[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, n_ctx);
+        kv.v[il] = ggml_new_tensor_3d(kv.ctx, GGML_TYPE_F16, head_dim, n_head_kv, n_ctx);
     }
 
     kv.buffer = ggml_backend_alloc_ctx_tensors(kv.ctx, backend);
     if (!kv.buffer) {
-        fprintf(stderr, "error: failed to allocate KV cache (%lld positions x %lld layers)\n",
-                (long long) N_CTX_MAX, (long long) hp.n_layer);
+        fprintf(stderr, "error: failed to allocate KV cache (%lld positions x %lld layers, %.0f MiB requested)\n",
+                (long long) n_ctx, (long long) hp.n_layer,
+                (double) kv_cache_bytes(m, hp, n_ctx) / (1024.0 * 1024.0));
         exit(1);
     }
     return kv;
+}
+
+size_t kv_cache_bytes(const model & m, const hparams & hp, int64_t n_ctx) {
+    if (hp.arch == arch_t::DORY) {
+        // sliding rings are context-independent; the module reports the affine cost
+        return dory_kv_cache_bytes(&m.dory, DORY_KV_LAST_LOOP, (uint32_t) n_ctx);
+    }
+
+    // keep in lockstep with init_kv_cache's per-layer sizing above
+    const size_t es = ggml_type_size(GGML_TYPE_F16);
+    size_t per_token = 0;
+    for (int64_t il = 0; il < hp.n_layer; il++) {
+        const int64_t n_head_kv = hp.arch == arch_t::NEMOTRON_H
+                                      ? std::max<int64_t>(1, hp.n_head_kv_layer[il])
+                                      : hp.n_head_kv;
+        per_token += (size_t)(hp.n_embd_head * n_head_kv) * es * 2; // K + V
+    }
+    return per_token * (size_t) n_ctx;
 }
 
 // ---- nemotron_h's Mamba2 recurrent state (conv window + SSM state), single-sequence only ----
@@ -804,6 +955,107 @@ void free_ssm_state(ssm_state & ss) {
     if (ss.ctx)    ggml_free(ss.ctx);
     ss.buffer = nullptr;
     ss.ctx = nullptr;
+}
+
+size_t ssm_state_bytes(const hparams & hp) {
+    // keep in lockstep with init_ssm_state's per-layer conv/state sizing above
+    if (hp.arch != arch_t::NEMOTRON_H && hp.arch != arch_t::QWEN35) return 0;
+    const size_t es = ggml_type_size(GGML_TYPE_F32);
+    size_t total = 0;
+    for (int64_t il = 0; il < hp.n_layer; il++) {
+        const bool recurrent = hp.arch == arch_t::NEMOTRON_H
+                                    ? hp.layer_kind(il) == layer_kind_t::SSM
+                                    : hp.is_deltanet_layer(il);
+        if (!recurrent) continue;
+        if (hp.arch == arch_t::NEMOTRON_H) {
+            if (hp.ssm_n_head <= 0) continue;
+            // conv [d_conv-1, d_inner + 2*n_group*d_state] + state [d_state, d_inner/n_head, n_head]
+            total += (size_t)(hp.ssm_d_conv - 1) *
+                     (size_t)(hp.ssm_d_inner + 2 * hp.ssm_n_group * hp.ssm_d_state) * es;
+            total += (size_t)(hp.ssm_d_state * (hp.ssm_d_inner / hp.ssm_n_head) * hp.ssm_n_head) * es;
+        } else {
+            // conv [d_conv-1, 3*n_head*head_dim] + DeltaNet state [head_dim, head_dim, n_head]
+            total += (size_t)(hp.dn_d_conv - 1) * (size_t)(3 * hp.dn_n_head * hp.dn_head_dim) * es;
+            total += (size_t)(hp.dn_head_dim * hp.dn_head_dim * hp.dn_n_head) * es;
+        }
+    }
+    return total;
+}
+
+// ---- automatic context sizing ----
+
+// bytes the kernel says can still be allocated without swapping (on Android this folds in
+// reclaimable page cache, unlike MemFree, so it's the right number to plan against); -1 when
+// /proc/meminfo is unavailable.
+static long long mem_available_bytes() {
+    FILE * f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char line[128];
+    long long kb = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "MemAvailable:", 13) == 0) { kb = atoll(line + 13); break; }
+    }
+    fclose(f);
+    return kb > 0 ? kb * 1024 : -1;
+}
+
+int64_t auto_n_ctx(const model & m, const hparams & hp, size_t weights_bytes) {
+    constexpr size_t kReserve      = (size_t) 384 << 20; // compute buffers + fragmentation + LMK slack
+    constexpr double kKeepFraction = 0.8;                // ... and leave 20% of the rest untouched too
+
+    const long long avail = mem_available_bytes();
+    if (avail <= 0) {
+        fprintf(stderr, "n_ctx=auto: /proc/meminfo unreadable -- falling back to %lld\n",
+                (long long) N_CTX_DEFAULT);
+        return N_CTX_DEFAULT;
+    }
+
+    const size_t ssm_bytes = ssm_state_bytes(hp);
+    size_t budget = (size_t) avail;
+    budget -= std::min(budget, kReserve);
+    budget -= std::min(budget, ssm_bytes);
+    budget = (size_t)((double) budget * kKeepFraction);
+
+    size_t per_tok = 0;
+    size_t kv_base = 0;
+    int64_t raw    = 0;
+    if (hp.arch == arch_t::DORY) {
+        // dory's cache is affine in n_ctx: a fixed sliding-ring base plus a per-token cost for
+        // the global ('*') rings only. Divide-by-per-token would count the base as a per-token
+        // cost -- solve base + per_token * n <= budget instead.
+        size_t per_ctx = 0;
+        dory_kv_cost(&m.dory, DORY_KV_LAST_LOOP, &kv_base, &per_ctx);
+        budget -= std::min(budget, kv_base);
+        per_tok = per_ctx;
+    } else {
+        per_tok = kv_cache_bytes(m, hp, 1);
+    }
+    raw = per_tok > 0 ? (int64_t)(budget / per_tok) : N_CTX_DEFAULT;
+    int64_t n_ctx = (raw / 64) * 64; // round down to a tidy multiple
+
+    int64_t limit = hp.n_ctx_train > 0 ? hp.n_ctx_train : 262144;
+    if (hp.arch == arch_t::PHI3 && hp.has_rope_scaling && hp.n_ctx_orig > 0) {
+        limit = std::min(limit, hp.n_ctx_orig); // only the short LongRoPE range is implemented here
+    }
+    if (hp.arch == arch_t::DORY) {
+        // dory's 9 global-attention rings cost 36 KiB/token of cache AND are re-read in full by
+        // 24 attention executions per forward step (96 KiB of KV reads per step per token of
+        // context, on top of the loop-unrolled weight traffic of several GB/step at k=4). Very
+        // large contexts are both pointless on the phone and a direct decode-speed tax -- cap
+        // the automatic sizing. (An explicit --ctx N still overrides this.)
+        limit = std::min<int64_t>(limit, 32768);
+    }
+    if (n_ctx > limit) n_ctx = limit;
+    if (n_ctx < 512) n_ctx = std::min<int64_t>(512, limit); // floor, but never above the trained limit
+
+    fprintf(stderr,
+            "n_ctx=auto: MemAvailable %.0f MiB, weights %.0f MiB, reserve %.0f MiB, ssm %.1f MiB\n"
+            "           kv base %.1f MiB + %.1f KiB per token -> %lld tokens (limit %lld%s) -> n_ctx=%lld\n",
+            (double) avail / (1024.0 * 1024.0), (double) weights_bytes / (1024.0 * 1024.0),
+            (double) kReserve / (1024.0 * 1024.0), (double) ssm_bytes / (1024.0 * 1024.0),
+            (double) kv_base / (1024.0 * 1024.0), (double) per_tok / 1024.0, (long long) raw,
+            (long long) limit, hp.n_ctx_train > 0 ? ", trained" : ", default cap", (long long) n_ctx);
+    return n_ctx;
 }
 
 // ---- graph construction: processes only the newest tokens, attending over the KV cache ----
@@ -1221,9 +1473,15 @@ static built_graph build_graph(struct ggml_context * ctx, const model & m, const
     return bg;
 }
 
-decode_session init_decode_session(ggml_backend_t backend, bool use_flash_attn) {
+decode_session init_decode_session(ggml_backend_t backend, const hparams & hp, bool use_flash_attn) {
     decode_session ds;
     size_t buf_size = ggml_tensor_overhead() * GGML_DEFAULT_GRAPH_SIZE + ggml_graph_overhead();
+    if (hp.arch == arch_t::DORY) {
+        // a dory forward unrolls 16 + 40*num_loops + 16 blocks (plus KV writes and one attention
+        // mask per block kind) -- several times the default graph budget; the module reports
+        // its own requirement
+        buf_size = dory_forward_ctx_bytes();
+    }
     ds.graph_buf.resize(buf_size);
     ds.galloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
     ds.use_flash_attn = use_flash_attn;
@@ -1241,6 +1499,55 @@ std::vector<float> forward_step(const model & m, const hparams & hp, kv_cache & 
                                  ssm_state * ss) {
     int64_t n_new = (int64_t) new_tokens.size();
     int64_t n_kv  = n_past + n_new;
+
+    if (hp.arch == arch_t::DORY) {
+        // Dory's graph is built entirely by the dory module: input blocks, num_loops x recurrent
+        // blocks (with per-loop cache slots), output blocks, the nGPT residual updates, and one
+        // attention mask per block kind. The surrounding machinery is the same as every other
+        // arch here: ds.graph_buf for the build context, ds.galloc for the activation buffer,
+        // the backend for input upload/compute/logits readback.
+        struct ggml_init_params gip = {
+            /*.mem_size   =*/ ds.graph_buf.size(),
+            /*.mem_buffer =*/ ds.graph_buf.data(),
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * gctx_build = ggml_init(gip);
+
+        struct dory_forward f = dory_forward_pass(gctx_build, &m.dory, &kv.dory, n_past, n_new);
+
+        if (!ggml_gallocr_alloc_graph(ds.galloc, f.gf)) {
+            fprintf(stderr, "error: dory graph allocation failed\n");
+            exit(1);
+        }
+
+        ggml_backend_tensor_set(f.tokens, new_tokens.data(), 0, n_new * sizeof(int32_t));
+
+        std::vector<int32_t> positions(n_new);
+        for (int64_t i = 0; i < n_new; i++) positions[i] = (int32_t)(n_past + i);
+        ggml_backend_tensor_set(f.positions, positions.data(), 0, n_new * sizeof(int32_t));
+
+        // one mask per block kind -- the ring geometry of sliding ('S') and global ('*')
+        // attention differs, and the module pre-computed which kinds this model has
+        if (f.mask != NULL) {
+            std::vector<ggml_fp16_t> mask((size_t) kv.dory.n_cells_sliding * n_new);
+            dory_fill_attn_mask(mask.data(), kv.dory.n_cells_sliding, n_past, n_new);
+            ggml_backend_tensor_set(f.mask, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        }
+        if (f.mask_full != NULL) {
+            std::vector<ggml_fp16_t> mask((size_t) kv.dory.n_cells_full * n_new);
+            dory_fill_attn_mask(mask.data(), kv.dory.n_cells_full, n_past, n_new);
+            ggml_backend_tensor_set(f.mask_full, mask.data(), 0, mask.size() * sizeof(ggml_fp16_t));
+        }
+
+        ggml_backend_graph_compute(backend, f.gf);
+
+        std::vector<float> last_logits(n_vocab);
+        size_t last_col_offset = (size_t)(n_new - 1) * n_vocab * sizeof(float);
+        ggml_backend_tensor_get(f.logits, last_logits.data(), last_col_offset, n_vocab * sizeof(float));
+
+        ggml_free(gctx_build); // frees only the ggml_context bookkeeping; ds.graph_buf is ours to reuse
+        return last_logits;
+    }
 
     struct ggml_init_params gip = {
         /*.mem_size   =*/ ds.graph_buf.size(),
@@ -1319,6 +1626,22 @@ std::vector<float> prefill(const model & m, const hparams & hp, kv_cache & kv, d
                             int64_t n_vocab, bool use_chunking, ssm_state * ss) {
     constexpr size_t kFastChunk = 8; // ggml-vulkan's mul_mat_vec_max_cols -- see block comment above
     constexpr size_t kBadZoneMax = 32; // beyond this, a single dispatch is already in the fast tiled-GEMM zone
+    constexpr size_t kDoryChunk  = 64; // see below
+
+    // dory always chunks, regardless of backend: its per-block cache rings bound a batch to the
+    // sliding window (dory_forward_pass asserts n_tokens <= n_cells_min), and the global-block
+    // attention mask costs n_ctx * n_new * 4 bytes transiently at graph-build time -- both call
+    // for small chunks. 64 keeps the mask footprint small while amortizing per-call overhead.
+    if (hp.arch == arch_t::DORY) {
+        const size_t chunk = std::max<size_t>(1, std::min<size_t>(kDoryChunk, kv.dory.n_cells_min));
+        std::vector<float> last_logits;
+        for (size_t off = 0; off < tokens.size(); off += chunk) {
+            size_t n = std::min(chunk, tokens.size() - off);
+            std::vector<int32_t> part(tokens.begin() + off, tokens.begin() + off + n);
+            last_logits = forward_step(m, hp, kv, ds, backend, n_past + (int64_t) off, part, n_vocab, ss);
+        }
+        return last_logits;
+    }
 
     if (!use_chunking || tokens.size() <= kFastChunk || tokens.size() > kBadZoneMax) {
         return forward_step(m, hp, kv, ds, backend, n_past, tokens, n_vocab, ss);

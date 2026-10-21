@@ -16,7 +16,10 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
   differences (fused vs separate QKV, QKV bias, per-head QK-Norm, fused vs separate FFN gate/up,
   tied vs untied output, RoPE variant and scaling) are handled through a small set of flags read
   from each model's own gguf metadata, not a separate code path per model.
-- A persistent F16 KV cache, sized per-model from its actual head/layer shape.
+- A persistent F16 KV cache, sized per-model from its actual head/layer shape. `run`, `chat`, and
+  `bench` auto-size the context window at load time from the RAM still free once the weights are
+  resident (minus a 384 MiB reserve and the hybrid SSM state, 20% headroom, rounded down and
+  clamped to the model's trained context length); `--ctx N` overrides it.
 - A real GPT-2-style byte-level BPE tokenizer: encoder (pretokenize + merge-rank BPE from the
   model's own `tokenizer.ggml.merges`) and decoder, not just a decoder.
 - **Both CPU and Vulkan execution**, selectable per run, sharing the identical graph-building
@@ -24,24 +27,69 @@ Mali-specific GPU backend -- this project's actual reason to exist -- still hasn
   the CPU-only bulk gguf loading path), so there's no separate "GPU version" to keep in sync.
 - A single `ggml-loader` CLI with four subcommands:
   - `ggml-loader inspect <model.gguf>` -- dump GGUF metadata and tensor list.
-  - `ggml-loader run <model.gguf> -p "prompt" -n N [--backend cpu|vulkan]` -- one-shot raw
-    completion (no chat template) with separate prefill/decode timing.
+  - `ggml-loader run <model.gguf> -p "prompt" [-n N] [--backend cpu|vulkan] [--ctx N]` -- one-shot
+    raw completion (no chat template, except `--edit-file` below) with separate prefill/decode timing.
+    - `-n N` is optional: without it the reply budget is the room left in `n_ctx` after the
+      prompt minus a 64-token EOS margin; an explicit `-n` that no longer fits is clamped to the
+      remaining room with a warning. Decoding stops early at EOS / the model's end-of-turn
+      token, and `--edit-file` additionally stops as soon as the rewrite's closing ``` fence has
+      been emitted.
     - `--edit-file <path> [--edit-on]`: wraps `<path>`'s contents plus the `-p` instruction into
-      a whole-file-rewrite prompt (e.g. `-p "Add debugging" --edit-file main.c --edit-on`).
+      a whole-file-rewrite prompt (e.g. `-p "Add debugging" --edit-file main.c --edit-on`),
+      encoded with the model's own chat template -- this is an instruction-following task, and a
+      bare raw prompt makes instruct models either emit EOS immediately (nemotron_h: 0 decoded
+      tokens) or degenerate into a bare-fence loop (llama-3.2-3b). `--thinking`/`--no-thinking`
+      control the reasoning trace for this mode (default: off; a think trace costs minutes at
+      these decode speeds).
       Without `--edit-on` it's a dry run (prints the rewrite, touches nothing). With
       `--edit-on`, the original is first backed up to `<path>.original`, then `<path>` is
       overwritten -- but only if the output passes a basic sanity check (non-trivial length,
-      balanced braces/parens/brackets), since these are small raw-completion models with no
-      diff/code-edit fine-tuning and can truncate or hallucinate on a full-file rewrite.
+      non-fence/substantive content, balanced braces/parens/brackets), since these are small
+      models with no diff/code-edit fine-tuning and can truncate or hallucinate on a full-file
+      rewrite.
       Extraction is robust to common small-model output patterns: it takes the LAST non-empty
       ``` fence (so an "improved" rewrite that comes after a "simple" draft is preferred), and
       also recognizes a `===== BEGIN FILE =====` / `===== END FILE =====` answer format that
       some models produce after seeing those markers in the prompt.
-  - `ggml-loader chat <model.gguf> [--system "text"] [--backend cpu|vulkan]` -- interactive
+    - `--search [--max-searches N]`: multi-step web-search tool call (off by default). The prompt
+      tells the model to emit `[SEARCH: <query>]` when it needs current information; the CLI
+      pauses decoding, runs the search with `curl | python3` (DuckDuckGo html endpoint, HTML
+      stripped, ~15 s cap), prefills a `[SEARCH RESULTS for <query>]: ...` block (or
+      `[SEARCH FAILED for <query>]` when nothing came back) into the live context, and resumes
+      decoding -- so the model can chain think -> search -> think -> search -> answer. Hard-capped
+      at N rounds per prompt (default 3; `--max-searches` implies `--search`); each result is
+      truncated to ~2000 chars, further if `n_ctx` demands it. Each round prints
+      `[Web Search i/N]: <query>` to stderr while it runs.
+  - `ggml-loader chat <model.gguf> [--system "text"] [-n N] [--backend cpu|vulkan]` -- interactive
     multi-turn chat using the model's actual instruct format (phi3-style, ChatML, or
     llama3's header-id format, picked automatically), conversation history threaded through the
     KV cache -- each turn only encodes+prefills the newest message, not the whole conversation.
-  - `ggml-loader bench <model.gguf> [--backend cpu|vulkan] [-p n][-n n][-r reps]` -- averaged
+    - `-n N`: optional max tokens per reply (a reasoning model's thinking tokens count towards
+      it, so raise it when replies get cut off). Default: the room left in the KV cache after
+      the prompt minus a 64-token EOS margin; an explicit `-n` that exceeds the room is clamped
+      to it with a warning. The available room shrinks as the conversation grows.
+    - `--show-thinking`/`--hide-thinking`: a reasoning model's think blocks are shown in dim gray
+      by default; `--hide-thinking` collapses them to a `[thinking hidden]` note instead.
+      `--thinking`/`--no-thinking` control whether the model reasons at all (default: on).
+    - `--search [--max-searches N]`: multi-step web-search tool call (off by default; same
+      contract as `run` above). The system prompt tells the model to emit `[SEARCH: <query>]`;
+      the CLI pauses generation, runs the search with `curl | python3` (DuckDuckGo html endpoint,
+      HTML stripped, ~15 s cap) and feeds a `[SEARCH RESULTS for <query>]: ...` block back into
+      the live context (default 3 rounds per reply via `--max-searches`, each result truncated to
+      ~2000 chars), so the model can search again after reading the results. A failed search
+      injects `[SEARCH FAILED for <query>]` instead, so the model can recover; each round prints
+      `[Web Search i/N]: <query>` on stderr.
+    - Multi-line input: a pasted block is sent as one message -- bracketed paste when the
+      terminal supports it, otherwise a rapid-line burst is detected; `/paste` followed by
+      the text and a final `/end` is the explicit form. (A plain multi-line paste would
+      otherwise arrive as one message per line, each getting its own full reply.)
+    - Local slash commands (intercepted by the CLI, never sent to the model; `/help` lists
+      them): `/load-file <path>` attaches a file's contents to the next message (in a
+      `File <path> contents:` + `===== BEGIN/END FILE =====` block); `/save [file]` writes the
+      conversation as a JSON message array (default `chat_history.json`); `/load <file>`
+      replaces the conversation with a saved one and rebuilds the KV cache by re-prefilling
+      the loaded history. Any other text that starts with `/` is sent as a normal message.
+  - `ggml-loader bench <model.gguf> [--backend cpu|vulkan] [-p n][-n n][-r reps] [--ctx N]` -- averaged
     pp/tg throughput (one untimed warmup cycle, then N timed repetitions on synthetic tokens),
     directly comparable to `llama-bench`'s own `-p`/`-n`/`-r`.
 
@@ -159,7 +207,7 @@ working tree, not upstream):
 ./build/ggml-loader run model.gguf -p "The capital of France is" -n 24 --backend vulkan
 ./build/ggml-loader run model.gguf -p "Add debugging" --edit-file main.c --edit-on
 ./build/ggml-loader run qwen2.5-coder:7b-instruct-q4_K_M -p "The capital of France is" --backend vulkan
-./build/ggml-loader chat model.gguf --backend vulkan
+./build/ggml-loader chat model.gguf -n 2048 --backend vulkan
 ./build/ggml-loader bench model.gguf -p 128 -n 64 -r 5 --backend vulkan
 ```
 

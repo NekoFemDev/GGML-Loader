@@ -20,8 +20,9 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s [model.gguf] [--backend cpu|vulkan] [-p n_prompt] [-n n_gen] [-r repetitions] [--flash-attn]\n"
-        "  defaults: -p 128 -n 64 -r 3, flash-attn off\n", argv0);
+        "usage: %s [model.gguf] [--backend cpu|vulkan] [-p n_prompt] [-n n_gen] [-r repetitions] [--flash-attn] [--ctx N]\n"
+        "  defaults: -p 128 -n 64 -r 3, flash-attn off; --ctx N: KV cache size (default: auto from\n"
+        "  the RAM free after loading, clamped to the model's trained context length)\n", argv0);
 }
 
 struct stats { double mean; double stddev; };
@@ -70,6 +71,8 @@ int cmd_bench(int argc, char ** argv) {
     int n_tg = 64;
     int n_reps = 3;
     bool flash_attn = false;
+    bool ctx_set = false;
+    int64_t ctx_override = 0;
 
     for (int i = 1; i < argc; i++) {
         std::string a = argv[i];
@@ -83,6 +86,9 @@ int cmd_bench(int argc, char ** argv) {
             n_reps = atoi(argv[++i]);
         } else if (a == "--flash-attn") {
             flash_attn = true;
+        } else if (a == "--ctx" && i + 1 < argc) {
+            ctx_override = atoll(argv[++i]);
+            ctx_set = true;
         } else if (a == "-h" || a == "--help") {
             print_usage(argv[0]);
             return 0;
@@ -92,9 +98,8 @@ int cmd_bench(int argc, char ** argv) {
         }
     }
 
-    if ((int64_t) n_pp + n_tg > N_CTX_MAX) {
-        fprintf(stderr, "error: -p (%d) + -n (%d) exceeds the %lld-token KV cache\n",
-                n_pp, n_tg, (long long) N_CTX_MAX);
+    if (ctx_set && ctx_override < 64) {
+        fprintf(stderr, "error: --ctx must be >= 64 (got %lld)\n", (long long) ctx_override);
         return 1;
     }
 
@@ -108,9 +113,20 @@ int cmd_bench(int argc, char ** argv) {
     model   m  = load_model(ws.ctx, hp);
     const int64_t n_vocab = m.token_embd->ne[1];
 
-    kv_cache kv = init_kv_cache(hp, backend);
+    // size the KV cache: auto from the RAM still free now that the weights are loaded, unless
+    // --ctx overrides it (the weights' own footprint is already subtracted by the kernel here)
+    const int64_t n_ctx = ctx_set ? ctx_override
+                                  : auto_n_ctx(m, hp, ggml_backend_buffer_get_size(ws.buffer));
+    if (ctx_set) fprintf(stderr, "n_ctx: %lld (from --ctx)\n", (long long) n_ctx);
+    if ((int64_t) n_pp + n_tg > n_ctx) {
+        fprintf(stderr, "error: -p (%d) + -n (%d) exceeds n_ctx (%lld); raise --ctx or lower them\n",
+                n_pp, n_tg, (long long) n_ctx);
+        return 1;
+    }
+
+    kv_cache kv = init_kv_cache(m, hp, backend, n_ctx);
     ssm_state ss = init_ssm_state(hp, backend); // no-op struct for every arch except nemotron_h
-    decode_session ds = init_decode_session(backend, flash_attn);
+    decode_session ds = init_decode_session(backend, hp, flash_attn);
 
     fprintf(stderr, "model=%s arch=%s backend=%s flash_attn=%d n_layer=%lld -- pp%d, tg%d, %d reps (+1 warmup)\n",
             model_path.c_str(), hp.arch_name.c_str(), backend_name.c_str(), (int) flash_attn,

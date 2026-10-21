@@ -27,6 +27,7 @@ add_subdirectory(third_party/ggml)
 add_executable(ggml-loader
     src/main.cpp
     src/model.cpp
+    src/dory.c
     src/ollama_model.cpp
     src/cmd_inspect.cpp
     src/cmd_run.cpp
@@ -41,6 +42,8 @@ add_executable(ggml-loader
     src/clip_tokenizer.cpp
     src/clip_text.cpp
     src/sdxl_unet.cpp
+    src/think_filter.cpp
+    src/web_search.cpp
 )
 target_link_libraries(ggml-loader PRIVATE ggml)
 target_include_directories(ggml-loader PRIVATE src)
