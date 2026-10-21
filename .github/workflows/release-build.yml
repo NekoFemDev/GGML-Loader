@@ -75,7 +75,16 @@ jobs:
           version: 1.4.313.0
 
       - name: Configure (static ggml, Vulkan ON)
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+        shell: pwsh
+        run: |
+          # the 7z-unpacked SDK layout isn't guaranteed (Bin/Lib/Include vs nesting) --
+          # locate the two pieces CMake's FindVulkan needs and hand them over explicitly
+          $lib = Get-ChildItem -Recurse -Filter vulkan-1.lib $env:VULKAN_SDK | Select-Object -First 1
+          $inc = Get-ChildItem -Recurse -Filter vulkan.h $env:VULKAN_SDK | Select-Object -First 1
+          if (-not $lib -or -not $inc) { Get-ChildItem $env:VULKAN_SDK; exit 1 }
+          $incdir = Split-Path (Split-Path $inc.FullName -Parent) -Parent
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF `
+            -DVulkan_LIBRARY="$($lib.FullName)" -DVulkan_INCLUDE_DIR="$incdir"
 
       - name: Build
         run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS
