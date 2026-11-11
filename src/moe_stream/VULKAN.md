@@ -565,3 +565,62 @@ Decode went from 0.61 tok/s (auto 1100/5871, 4 threads, lm_head re-uploaded)
 to **0.72–0.86 tok/s** at a fixed 1024/2048 budget (best observed 0.86). The
 1.8 tok/s target was not reached; the remaining gap is kernel-bound, and the
 three tiling/occupancy attempts each lost to the simple row shader on this GPU.
+
+---
+
+# Phase 5 — decode profiling and 128-thread workgroups
+
+## Timestamp profiler
+
+`VkQueryPool` timestamps are written around each command buffer; `end_batch`
+reads them after the fence and accumulates:
+
+- **gpu** — GPU execution time from the timestamps
+- **submit/wait** — wall time in `vkQueueSubmit` + `vkWaitForFences` minus GPU
+- **record/upload** — CPU time building the command buffer (x copies, descriptor
+  updates, recording)
+
+`compute_vulkan_profile_reset()` is called after prefill, so the report covers
+decode only. A run at 1024/2048, 8 generated tokens:
+
+```
+[vk profile] batches=2169 dispatch=12537
+             gpu=5263 ms (61%)  submit/wait=2467 ms (29%)  record/upload=846 ms (10%)
+```
+
+Per token: **241 batches** (5 per layer + lm_head), **~1.14 ms per submit/wait**.
+So decode is now roughly 2/3 kernel and 1/3 submission latency — the batching
+work removed the earlier 1,392-submit collapse, but 241 per token is still
+expensive at this fence latency.
+
+Why 241 and not fewer: qkv and o are separated by CPU attention; the router must
+finish before expert selection; gate/up precede the CPU swiglu; down precedes
+the residual. Each dependency forces a fence.
+
+## 128-thread workgroups
+
+`matmul_wg128.comp` is the row shader with `local_size_x = 128`: 128 rows per
+workgroup, half as many workgroups, same per-row code. Correct (2.5e-06).
+End-to-end it is neutral-to-slightly-worse:
+
+| variant | decode | decode GPU time |
+|---|---|---|
+| row (64) | 0.82 tok/s | 5.26 s |
+| row-128 | 0.78 tok/s | 5.62 s |
+
+The GPU time itself did not improve, so the kernel is not short of resident
+threads; more latency hiding does not help. Kept behind `MOE_VK_WG128=1`.
+
+## What the profile says to do next
+
+1. **Cut batches per token.** The cheapest reduction is moving the router matmul
+   to the CPU: 128x2048 f32 is ~0.26 MMAC, ~0.1 ms scalar, and it removes one
+   submit/wait per layer (48 per token). Attention on the GPU would merge qkv+o
+   into one batch and save another 48.
+2. **Fence latency.** 1.14 ms per batch is high for a compute queue; a bounded
+   spin on `vkGetFenceStatus` before falling back to `vkWaitForFences` is worth
+   measuring on this driver.
+3. **Kernel throughput** remains 61% of decode. Coalesced, no-shared, 8x8 and
+   16-token variants all lost to the row shader; the next candidate needs a
+   different decomposition (e.g. one workgroup per row with a subgroup
+   reduction), not another tiling of the same mapping.

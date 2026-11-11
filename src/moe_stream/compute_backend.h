@@ -76,5 +76,7 @@ void *compute_vulkan_arena_alloc(void *user, size_t size);
 void  compute_vulkan_arena_free(void *user, void *ptr, size_t size);
 void  compute_vulkan_arena_shutdown(void);
 void  compute_vulkan_cache_clear(void);
+void  compute_vulkan_profile_report(void);
+void  compute_vulkan_profile_reset(void);
 
 #endif /* MOE_COMPUTE_BACKEND_H */

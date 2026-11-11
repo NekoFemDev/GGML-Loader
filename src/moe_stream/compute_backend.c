@@ -194,6 +194,8 @@ void *compute_vulkan_arena_alloc(void *u, size_t s) { (void)u; (void)s; return N
 void  compute_vulkan_arena_free(void *u, void *p, size_t s) { (void)u; (void)p; (void)s; }
 void  compute_vulkan_arena_shutdown(void) { }
 void  compute_vulkan_cache_clear(void) { }
+void  compute_vulkan_profile_report(void) { }
+void  compute_vulkan_profile_reset(void) { }
 #endif
 
 const compute_backend_t *compute_backend_vulkan(void)

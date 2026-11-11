@@ -12,6 +12,7 @@ GLSLC=${GLSLC:-glslc}
 "$GLSLC" --target-env=vulkan1.1 -O matmul_gemm.comp  -o "$OUT/matmul_gemm.spv"
 "$GLSLC" --target-env=vulkan1.1 -O matmul_coalesced.comp -o "$OUT/matmul_coalesced.spv"
 "$GLSLC" --target-env=vulkan1.1 -O matmul_noshared.comp  -o "$OUT/matmul_noshared.spv"
+"$GLSLC" --target-env=vulkan1.1 -O matmul_wg128.comp     -o "$OUT/matmul_wg128.spv"
 
 if command -v spirv-val >/dev/null 2>&1; then
     spirv-val --target-env vulkan1.1 "$OUT/matmul_f32.spv"
@@ -19,7 +20,8 @@ if command -v spirv-val >/dev/null 2>&1; then
     spirv-val --target-env vulkan1.1 "$OUT/matmul_gemm.spv"
     spirv-val --target-env vulkan1.1 "$OUT/matmul_coalesced.spv"
     spirv-val --target-env vulkan1.1 "$OUT/matmul_noshared.spv"
+    spirv-val --target-env vulkan1.1 "$OUT/matmul_wg128.spv"
 fi
 
-python3 spv2h.py "$OUT/matmul_f32.spv" "$OUT/matmul_quant.spv" "$OUT/matmul_gemm.spv" "$OUT/matmul_coalesced.spv" "$OUT/matmul_noshared.spv" > ../vulkan_shaders.h
+python3 spv2h.py "$OUT/matmul_f32.spv" "$OUT/matmul_quant.spv" "$OUT/matmul_gemm.spv" "$OUT/matmul_coalesced.spv" "$OUT/matmul_noshared.spv" "$OUT/matmul_wg128.spv" > ../vulkan_shaders.h
 echo "wrote ../vulkan_shaders.h"

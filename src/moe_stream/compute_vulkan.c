@@ -35,6 +35,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include <vulkan/vulkan.h>
 
@@ -91,6 +92,18 @@ typedef struct {
     VkPipeline            pipe_gemm;
     VkPipeline            pipe_coal;
     VkPipeline            pipe_noshared;
+    VkPipeline            pipe_wg128;
+
+    /* timestamp profiling */
+    VkQueryPool qpool;
+    int         timestamps;
+    float       ts_period;
+    double      prof_t0;
+    uint64_t    prof_batches;
+    uint64_t    prof_dispatches;
+    double      prof_gpu_ms;
+    double      prof_submit_ms;
+    double      prof_record_ms;
 
     /* per-slot staging for batched dispatches */
     VkBuffer       xbuf;
@@ -130,9 +143,17 @@ typedef struct {
     char name[256];
 } vk_state_t;
 
+static double vk_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+
 static vk_state_t g_vk;
 static int g_coalesced = -1;   /* MOE_VK_COALESCED */
 static int g_noshared  = -1;   /* MOE_VK_NOSHARED  */
+static int g_wg128     = -1;   /* MOE_VK_WG128     */
 
 /* One host-visible VkBuffer shared by the expert LRU and the GPU. The streamer
  * pread()s directly into this mapping, so there is no host copy and no upload. */
@@ -504,15 +525,30 @@ static int vk_init(vk_state_t *s)
     s->pipe_gemm = build_pipeline(s, matmul_gemm_spv, matmul_gemm_spv_len);
     s->pipe_coal = build_pipeline(s, matmul_coalesced_spv, matmul_coalesced_spv_len);
     s->pipe_noshared = build_pipeline(s, matmul_noshared_spv, matmul_noshared_spv_len);
+    s->pipe_wg128    = build_pipeline(s, matmul_wg128_spv, matmul_wg128_spv_len);
     if (!s->pipe_f32 || !s->pipe_q || !s->pipe_gemm || !s->pipe_coal ||
-        !s->pipe_noshared) {
+        !s->pipe_noshared || !s->pipe_wg128) {
         return -1;
+    }
+
+    VkQueryPoolCreateInfo qpci = {
+        .sType      = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
+        .queryType  = VK_QUERY_TYPE_TIMESTAMP,
+        .queryCount = 2,
+    };
+    if (props.limits.timestampComputeAndGraphics &&
+        vkCreateQueryPool(s->dev, &qpci, NULL, &s->qpool) == VK_SUCCESS) {
+        s->timestamps = 1;
+        s->ts_period  = props.limits.timestampPeriod;
     }
     if (g_coalesced < 0) {
         g_coalesced = getenv("MOE_VK_COALESCED") != NULL;
         g_noshared = getenv("MOE_VK_NOSHARED") != NULL;
-        fprintf(stderr, "[vk] GEMV variant: %s\n",
-                g_noshared ? "no-shared-x" : (g_coalesced ? "coalesced" : "row"));
+        g_wg128    = getenv("MOE_VK_WG128") != NULL;
+        fprintf(stderr, "[vk] GEMV variant: %s, timestamps: %s\n",
+                g_wg128 ? "row-128" : (g_noshared ? "no-shared-x"
+                        : (g_coalesced ? "coalesced" : "row")),
+                s->timestamps ? "on" : "off");
     }
 
     VkDescriptorPoolSize dps = {
@@ -719,6 +755,12 @@ static void vk_begin_batch(void *self)
     s->in_batch = 1;
     s->slot     = 0;
     s->npending = 0;
+    s->prof_t0  = vk_now_ms();
+    if (s->timestamps) {
+        vkCmdResetQueryPool(s->cmd, s->qpool, 0, 2);
+        vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            s->qpool, 0);
+    }
     for (int i = 0; i < s->ncache; i++) {
         s->cache[i].pinned = 0;
     }
@@ -731,12 +773,18 @@ static int vk_end_batch(void *self)
         return 0;
     }
 
+    if (s->timestamps) {
+        vkCmdWriteTimestamp(s->cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                            s->qpool, 1);
+    }
+    const double t_record = vk_now_ms() - s->prof_t0;
     if (vkEndCommandBuffer(s->cmd) != VK_SUCCESS) {
         s->in_batch = 0;
         s->state    = -1;
         return -1;
     }
 
+    const double t_sub0 = vk_now_ms();
     vkResetFences(s->dev, 1, &s->fence);
     VkSubmitInfo si = {
         .sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO,
@@ -749,6 +797,23 @@ static int vk_end_batch(void *self)
         s->state    = -1;
         return -1;
     }
+
+    const double t_sub = vk_now_ms() - t_sub0;
+    double gpu_ms = 0.0;
+    if (s->timestamps) {
+        uint64_t ts[2] = { 0, 0 };
+        if (vkGetQueryPoolResults(s->dev, s->qpool, 0, 2, sizeof(ts), ts,
+                                  sizeof(uint64_t),
+                                  VK_QUERY_RESULT_64_BIT |
+                                  VK_QUERY_RESULT_WAIT_BIT) == VK_SUCCESS) {
+            gpu_ms = (double)(ts[1] - ts[0]) * (double)s->ts_period / 1e6;
+        }
+    }
+    s->prof_gpu_ms    += gpu_ms;
+    s->prof_submit_ms += (t_sub > gpu_ms) ? (t_sub - gpu_ms) : 0.0;
+    s->prof_record_ms += t_record;
+    s->prof_batches++;
+    s->prof_dispatches += (uint64_t)s->npending;
 
     for (int i = 0; i < s->npending; i++) {
         const uint8_t *src = s->pending[i].from_batch
@@ -805,6 +870,9 @@ static int bind_slot(vk_state_t *s, int slot, VkBuffer wbuf, VkDeviceSize woff,
 static VkPipeline pick_gemv_pipe(vk_state_t *s, uint32_t type)
 {
     if (type != GGML_T_F32) {
+        if (g_wg128 > 0 && s->pipe_wg128) {
+            return s->pipe_wg128;
+        }
         if (g_noshared > 0 && s->pipe_noshared) {
             return s->pipe_noshared;
         }
@@ -813,6 +881,13 @@ static VkPipeline pick_gemv_pipe(vk_state_t *s, uint32_t type)
         }
     }
     return (type == GGML_T_F32) ? s->pipe_f32 : s->pipe_q;
+}
+
+static uint32_t gemv_groups(vk_state_t *s, uint32_t type, uint64_t ne1)
+{
+    const uint32_t wg = (type != GGML_T_F32 && pick_gemv_pipe(s, type) == s->pipe_wg128)
+        ? 128u : 64u;
+    return (uint32_t)((ne1 + wg - 1u) / wg);
 }
 
 static int record_dispatch(vk_state_t *s, int slot,
@@ -830,7 +905,7 @@ static int record_dispatch(vk_state_t *s, int slot,
                             s->playout, 0, 1, &s->dset[slot], 0, NULL);
     vkCmdPushConstants(s->cmd, s->playout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(s->cmd, (uint32_t)((ne1 + 63) / 64), 1, 1);
+    vkCmdDispatch(s->cmd, gemv_groups(s, type, ne1), 1, 1);
     return 0;
 }
 
@@ -908,6 +983,7 @@ static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
         uint32_t ne0, ne1, type, x_off, y_off, pad;
     } pc = { (uint32_t)ne0, (uint32_t)ne1, type, 0, 0, 0 };
 
+    const double t0 = vk_now_ms();
     vkResetFences(s->dev, 1, &s->fence);
     vkResetCommandBuffer(s->cmd, 0);
     VkCommandBufferBeginInfo bi = {
@@ -921,7 +997,7 @@ static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
                             s->playout, 0, 1, &s->dset[VK_MAX_BATCH], 0, NULL);
     vkCmdPushConstants(s->cmd, s->playout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(pc), &pc);
-    vkCmdDispatch(s->cmd, (uint32_t)((ne1 + 63) / 64), 1, 1);
+    vkCmdDispatch(s->cmd, gemv_groups(s, type, ne1), 1, 1);
     vkEndCommandBuffer(s->cmd);
 
     VkSubmitInfo si = {
@@ -935,6 +1011,9 @@ static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
         fallback_matmul(type, w, ne0, ne1, x, y);
         return;
     }
+    s->prof_record_ms += vk_now_ms() - t0;
+    s->prof_batches++;
+    s->prof_dispatches++;
     memcpy(y, s->smap[2], ybytes);
 }
 
@@ -1157,6 +1236,32 @@ static void vk_matmul_batch(void *self, uint32_t type, const uint8_t *w,
 }
 
 /* ---- vtable ------------------------------------------------------------- */
+
+void compute_vulkan_profile_reset(void)
+{
+    g_vk.prof_batches    = 0;
+    g_vk.prof_dispatches = 0;
+    g_vk.prof_gpu_ms     = 0;
+    g_vk.prof_submit_ms  = 0;
+    g_vk.prof_record_ms  = 0;
+}
+
+void compute_vulkan_profile_report(void)
+{
+    if (g_vk.prof_batches == 0) {
+        return;
+    }
+    const double total = g_vk.prof_gpu_ms + g_vk.prof_submit_ms +
+                         g_vk.prof_record_ms;
+    fprintf(stderr,
+            "[vk profile] batches=%llu dispatch=%llu  gpu=%.0f ms (%.0f%%)  "
+            "submit/wait=%.0f ms (%.0f%%)  record/upload=%.0f ms (%.0f%%)\n",
+            (unsigned long long)g_vk.prof_batches,
+            (unsigned long long)g_vk.prof_dispatches,
+            g_vk.prof_gpu_ms, total > 0 ? 100.0 * g_vk.prof_gpu_ms / total : 0,
+            g_vk.prof_submit_ms, total > 0 ? 100.0 * g_vk.prof_submit_ms / total : 0,
+            g_vk.prof_record_ms, total > 0 ? 100.0 * g_vk.prof_record_ms / total : 0);
+}
 
 int compute_vulkan_is_ready(void) { return g_vk.state == 1; }
 const char *compute_vulkan_device_name(void) { return g_vk.name[0] ? g_vk.name : "none"; }

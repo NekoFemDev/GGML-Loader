@@ -313,6 +313,7 @@ int main(int argc, char **argv)
     expert_io_close(&io);
     gguf_index_free(&idx);
 
+    compute_vulkan_profile_report();
     printf("\n%s\n", ok ? "all shader checks passed" : "SHADER MISMATCH");
     return ok ? 0 : 1;
 }

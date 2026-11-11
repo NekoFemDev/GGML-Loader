@@ -229,6 +229,7 @@ int main(int argc, char **argv)
             continue;
         }
         const double t_pre1 = now_ms();
+        compute_vulkan_profile_reset();   /* report decode only */
 
         printf("%sassistant>%s ", COLOR_BOLD, COLOR_OFF);
         fflush(stdout);
@@ -287,6 +288,8 @@ int main(int argc, char **argv)
             qwen_forward(m, im_end);
         }
     }
+
+    compute_vulkan_profile_report();
 
     free(line);
     free(prompt);
