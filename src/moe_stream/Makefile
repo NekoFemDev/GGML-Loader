@@ -24,7 +24,7 @@ BRIDGE_OBJ  := $(addprefix $(BUILD)/,$(BRIDGE:.c=.o))
 
 .PHONY: all clean test generate lib vulkan
 
-all: $(BUILD)/moe_stream_test $(BUILD)/moe_generate $(BUILD)/libmoe_bridge.a
+all: $(BUILD)/moe_stream_test $(BUILD)/moe_generate $(BUILD)/moe_chat $(BUILD)/libmoe_bridge.a
 
 lib: $(BUILD)/libmoe_bridge.a
 
@@ -46,6 +46,9 @@ $(BUILD)/moe_stream_test: $(CORE_OBJ) $(BUILD)/test_moe_stream.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(BUILD)/moe_generate: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BUILD)/test_generate.o
+	$(CC) $^ -o $@ $(LDFLAGS)
+
+$(BUILD)/moe_chat: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BUILD)/chat.o
 	$(CC) $^ -o $@ $(LDFLAGS)
 
 $(BUILD)/test_vulkan: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BUILD)/test_vulkan.o
