@@ -67,9 +67,8 @@ Wired into the large allocations only: resident weights (`mt_load`), the KV
 cache, the expert arena, the Vulkan resident-weight cache, and the default LRU
 allocator. Scratch buffers are small and untracked.
 
-On overflow the allocation fails, `qwen_load` returns NULL, the bridge returns
-an error, and the process exits with a diagnostic instead of waiting for the
-LMK:
+On overflow the allocation fails, `qwen_load` returns NULL, and the CLI exits
+with a diagnostic instead of waiting for the LMK:
 
 ```
 [OOM] Reached memory limit: 733 MiB in use + 243 MiB requested > 900 MiB cap

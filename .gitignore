@@ -11,6 +11,5 @@ build/
 sdxl/
 reference/
 
-# MoE engine / Go CLI working files
+# Local analysis clone
 airllm-main/
-gobridge/ggml-loader

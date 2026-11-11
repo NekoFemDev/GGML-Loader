@@ -200,6 +200,28 @@ working tree, not upstream):
   verified bit-for-bit identical output against `--backend vulkan` (unaffected by the bug) and
   against the other already-working models before/after the patch.
 
+## MoE engine (`src/moe_stream`)
+
+A self-contained C implementation for sparse MoE models (validated with
+Qwen3-30B-A3B), separate from the dense ggml path above:
+
+- expert streaming from GGUF with `pread`/`O_DIRECT`, byte-budgeted LRU with
+  TinyLFU admission
+- q4_K / q5_K / q6_K dequantisation on the fly; scalar and Vulkan backends
+- layer-sweep prefill (each expert read once per layer, applied to all routed tokens)
+- host/GPU-shared expert arena (one mapped Vulkan buffer, no upload copies)
+- memory tracker with a hard cap and a clean `[OOM]` failure instead of an LMK kill
+- ChatML CLI with automatic context/cache sizing from `MemAvailable`
+
+```sh
+cd src/moe_stream
+make VULKAN=1 all
+./build/moe_chat model.gguf --backend vulkan
+```
+
+`--ctx` and `--cache-mb` default to `calculate_optimal_cache()`; override them
+for a tighter budget. See `MEMORY.md`, `VULKAN.md`, and `moe_c_plan.md`.
+
 ## Usage
 
 ```sh

@@ -1,5 +1,4 @@
 CC      ?= gcc
-AR      ?= ar
 VULKAN  ?= 0
 
 CFLAGS  ?= -std=c11 -O3 -g -Wall -Wextra -Wshadow -pthread -ffast-math
@@ -15,18 +14,15 @@ BUILD   := build
 CORE    := expert_loader.c lru_cache.c gguf_index.c moe_stream.c memtrack.c
 MODEL   := dequant.c tokenizer.c qwen_model.c autotune.c
 BACKEND := compute_backend.c compute_vulkan.c
-BRIDGE  := moe_bridge.c
 
 CORE_OBJ    := $(addprefix $(BUILD)/,$(CORE:.c=.o))
 MODEL_OBJ   := $(addprefix $(BUILD)/,$(MODEL:.c=.o))
 BACKEND_OBJ := $(addprefix $(BUILD)/,$(BACKEND:.c=.o))
-BRIDGE_OBJ  := $(addprefix $(BUILD)/,$(BRIDGE:.c=.o))
 
-.PHONY: all clean test generate lib vulkan
+.PHONY: all clean test generate vulkan
 
-all: $(BUILD)/moe_stream_test $(BUILD)/moe_generate $(BUILD)/moe_chat $(BUILD)/libmoe_bridge.a
+all: $(BUILD)/moe_stream_test $(BUILD)/moe_generate $(BUILD)/moe_chat
 
-lib: $(BUILD)/libmoe_bridge.a
 
 vulkan:
 	$(MAKE) clean
@@ -53,9 +49,6 @@ $(BUILD)/moe_chat: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BUILD)/chat.o
 
 $(BUILD)/test_vulkan: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BUILD)/test_vulkan.o
 	$(CC) $^ -o $@ $(LDFLAGS)
-
-$(BUILD)/libmoe_bridge.a: $(CORE_OBJ) $(MODEL_OBJ) $(BACKEND_OBJ) $(BRIDGE_OBJ)
-	$(AR) rcs $@ $^
 
 test: $(BUILD)/moe_stream_test
 	./$(BUILD)/moe_stream_test ../../Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf --cache-mb 1024 --threads 4 --direct
