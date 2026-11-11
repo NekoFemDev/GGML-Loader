@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define LINE_MAX_LEN  8192
 #define PROMPT_MAX    65536
@@ -31,6 +32,13 @@
 #define COLOR_BOLD  "\033[1m"
 #define COLOR_DIM   "\033[2m"
 #define COLOR_OFF   "\033[0m"
+
+static double now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
 
 static void usage(void)
 {
@@ -215,16 +223,19 @@ int main(int argc, char **argv)
                    COLOR_DIM, n_ids, qwen_pos(m), COLOR_OFF);
         }
 
+        const double t_pre0 = now_ms();
         if (qwen_prefill(m, (const uint32_t *)ids, n_ids) != 0) {
             fprintf(stderr, "prefill failed\n");
             continue;
         }
+        const double t_pre1 = now_ms();
 
         printf("%sassistant>%s ", COLOR_BOLD, COLOR_OFF);
         fflush(stdout);
 
-        int last = -1;
-        int stopped = 0;
+        int    last    = -1;
+        int    stopped = 0;
+        int    emitted = 0;
         for (int k = 0; k < max_new; k++) {
             const int id = qwen_argmax(m);
             if (id < 0) {
@@ -243,6 +254,7 @@ int main(int argc, char **argv)
                 fflush(stdout);
             }
             last = id;
+            emitted++;
 
             if (k + 1 >= max_new) {
                 break;   /* last emitted; forwarded after the loop */
@@ -251,7 +263,15 @@ int main(int argc, char **argv)
                 break;
             }
         }
+        const double t_dec1 = now_ms();
         printf("\n");
+        printf("%s[prefill] %d tok in %.1f s (%.1f tok/s)  |  "
+               "decode %d tok in %.1f s (%.2f tok/s)%s\n",
+               COLOR_DIM, n_ids, (t_pre1 - t_pre0) / 1000.0,
+               n_ids * 1000.0 / (t_pre1 - t_pre0),
+               emitted, (t_dec1 - t_pre1) / 1000.0,
+               emitted > 0 ? emitted * 1000.0 / (t_dec1 - t_pre1) : 0.0,
+               COLOR_OFF);
 
         /* Close the turn: push the last emitted token (the C loop stops
          * before forwarding it), then <|im_end|>, so the next prompt is
