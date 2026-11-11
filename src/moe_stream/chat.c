@@ -141,15 +141,41 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    int end_ids[8];
-    int n_end = tok_encode(&tok, "<|im_end|>", end_ids, 8);
-    if (n_end <= 0) {
-        fprintf(stderr, "cannot encode <|im_end|>\n");
-        return 1;
+    /* Qwen can close an assistant turn with either <|im_end|> or the base
+     * <|endoftext|> EOS. Stopping only on the former lets the model run on
+     * into a pretraining-style "Human: ..." continuation. */
+    static const char *const stop_strings[] = { "<|im_end|>", "<|endoftext|>" };
+    int stop_ids[8];
+    int n_stop = 0;
+    int im_end = -1;
+
+    for (size_t i = 0; i < sizeof(stop_strings) / sizeof(stop_strings[0]); i++) {
+        int ids[8];
+        int n = tok_encode(&tok, stop_strings[i], ids, 8);
+        if (n <= 0) {
+            continue;
+        }
+        if (im_end < 0) {
+            im_end = ids[0];
+        }
+        for (int j = 0; j < n && n_stop < 8; j++) {
+            int seen = 0;
+            for (int k = 0; k < n_stop; k++) {
+                if (stop_ids[k] == ids[j]) {
+                    seen = 1;
+                }
+            }
+            if (!seen) {
+                stop_ids[n_stop++] = ids[j];
+            }
+        }
+        if (debug) {
+            printf("[debug] %s -> id %d (%d token(s))\n", stop_strings[i], ids[0], n);
+        }
     }
-    const int im_end = end_ids[0];
-    if (debug) {
-        printf("[debug] <|im_end|> -> id %d (%d token(s))\n", im_end, n_end);
+    if (im_end < 0) {
+        fprintf(stderr, "cannot encode stop tokens\n");
+        return 1;
     }
 
     char  *line   = (char *)malloc(LINE_MAX_LEN);
@@ -242,15 +268,30 @@ int main(int argc, char **argv)
             if (id < 0) {
                 break;
             }
-            if (id == im_end) {
+            int is_stop = 0;
+            for (int si = 0; si < n_stop; si++) {
+                if (id == stop_ids[si]) {
+                    is_stop = 1;
+                    break;
+                }
+            }
+            if (is_stop) {
                 last    = id;
                 stopped = 1;
+                if (debug) {
+                    printf("%s[debug] stop token %d%s\n", COLOR_DIM, id, COLOR_OFF);
+                }
                 break;
             }
 
             char text[256];
             int  n = tok_decode(&tok, id, text, sizeof(text));
             if (n > 0) {
+                if (strstr(text, "<|im_end|>") || strstr(text, "<|endoftext|>")) {
+                    last    = id;
+                    stopped = 1;
+                    break;
+                }
                 fwrite(text, 1, (size_t)n, stdout);
                 fflush(stdout);
             }
