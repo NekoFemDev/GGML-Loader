@@ -1,0 +1,184 @@
+#version 450
+
+// Prefill GEMM: y[t][row] = dot(dequant(W[row]), x[t])
+//
+// One invocation per output row (64 per workgroup). Each invocation keeps 16
+// token accumulators, so a weight element is decoded once and reused 16 times.
+// x is staged in shared memory per (256-block, 64-subgroup) tile, which the
+// whole workgroup shares across its 64 rows.
+//
+// This is the prefill counterpart of matmul_quant.comp. It is only used when
+// n_tokens > 1; decode keeps the GEMV shader.
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint ne0;
+    uint ne1;
+    uint type;      // 12 q4_K, 13 q5_K, 14 q6_K
+    uint n_tokens;
+    uint x_off;     // unused here
+    uint y_off;     // unused here
+} pc;
+
+shared float xs[16][64];
+
+uint byteAt(uint off)
+{
+    return (w[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+uint u16At(uint off)
+{
+    return byteAt(off) | (byteAt(off + 1u) << 8u);
+}
+
+float f16At(uint off)
+{
+    return unpackHalf2x16(u16At(off)).x;
+}
+
+int s8At(uint off)
+{
+    int v = int(byteAt(off));
+    return v >= 128 ? v - 256 : v;
+}
+
+void getScaleMin(uint j, uint base, out uint d, out uint m)
+{
+    if (j < 4u) {
+        d = byteAt(base + j) & 63u;
+        m = byteAt(base + j + 4u) & 63u;
+    } else {
+        d = (byteAt(base + j + 4u) & 0x0Fu) | ((byteAt(base + j - 4u) >> 6u) << 4u);
+        m = (byteAt(base + j + 4u) >> 4u)    | ((byteAt(base + j)      >> 6u) << 4u);
+    }
+}
+
+void main()
+{
+    const uint row    = gl_GlobalInvocationID.x;
+    const uint tid    = gl_LocalInvocationID.x;
+    const bool row_ok = row < pc.ne1;
+
+    const uint block_bytes = pc.type == 12u ? 144u : (pc.type == 13u ? 176u : 210u);
+    const uint rb          = row * (pc.ne0 / 256u) * block_bytes;
+    const uint nblk        = pc.ne0 / 256u;
+
+    for (uint t0 = 0u; t0 < pc.n_tokens; t0 += 16u) {
+        float acc[16];
+        for (int t = 0; t < 16; ++t) {
+            acc[t] = 0.0;
+        }
+
+        for (uint b = 0u; b < nblk; ++b) {
+            const uint off = rb + b * block_bytes;
+            const float d    = f16At(off);
+            const float dmin = (pc.type == 14u) ? 0.0 : f16At(off + 2u);
+
+            for (uint j = 0u; j < 4u; ++j) {
+                /* cooperative x tile: 16 tokens x 64 elements */
+                for (uint i = tid; i < 16u * 64u; i += 64u) {
+                    const uint  t  = i >> 6u;
+                    const uint  kk = i & 63u;
+                    const uint  ti = t0 + t;
+                    float v = 0.0;
+                    if (ti < pc.n_tokens) {
+                        v = x[ti * pc.ne0 + b * 256u + j * 64u + kk];
+                    }
+                    xs[t][kk] = v;
+                }
+                barrier();
+
+                if (row_ok) {
+                    if (pc.type == 12u) {
+                        uint s0, m0, s1, m1;
+                        getScaleMin(j * 2u,      off + 4u, s0, m0);
+                        getScaleMin(j * 2u + 1u, off + 4u, s1, m1);
+                        const float d1  = d * float(s0);
+                        const float mm1 = dmin * float(m0);
+                        const float d2  = d * float(s1);
+                        const float mm2 = dmin * float(m1);
+                        const uint  qs  = off + 16u + j * 32u;
+
+                        for (uint l = 0u; l < 32u; ++l) {
+                            const uint q  = byteAt(qs + l);
+                            const float w1 = d1 * float(q & 0x0Fu) - mm1;
+                            const float w2 = d2 * float(q >> 4u)   - mm2;
+                            for (int t = 0; t < 16; ++t) {
+                                acc[t] += w1 * xs[t][l] + w2 * xs[t][l + 32u];
+                            }
+                        }
+                    } else if (pc.type == 13u) {
+                        uint s0, m0, s1, m1;
+                        getScaleMin(j * 2u,      off + 4u, s0, m0);
+                        getScaleMin(j * 2u + 1u, off + 4u, s1, m1);
+                        const float d1  = d * float(s0);
+                        const float mm1 = dmin * float(m0);
+                        const float d2  = d * float(s1);
+                        const float mm2 = dmin * float(m1);
+                        const uint  qh  = off + 16u;
+                        const uint  ql  = off + 48u + j * 32u;
+                        const uint  u1  = 1u << (2u * j);
+                        const uint  u2  = 2u << (2u * j);
+
+                        for (uint l = 0u; l < 32u; ++l) {
+                            const uint  q  = byteAt(ql + l);
+                            const uint  hb = byteAt(qh + l);
+                            const uint  lo = (q & 0x0Fu) + ((hb & u1) != 0u ? 16u : 0u);
+                            const uint  hi = (q >> 4u)   + ((hb & u2) != 0u ? 16u : 0u);
+                            const float w1 = d1 * float(lo) - mm1;
+                            const float w2 = d2 * float(hi) - mm2;
+                            for (int t = 0; t < 16; ++t) {
+                                acc[t] += w1 * xs[t][l] + w2 * xs[t][l + 32u];
+                            }
+                        }
+                    } else {
+                        const uint n    = j >> 1u;
+                        const uint halfsel = j & 1u;
+                        const uint ql0  = off + n * 64u;
+                        const uint qh0  = off + 128u + n * 32u;
+                        const uint sc0  = off + 192u + n * 8u;
+
+                        for (uint l = 0u; l < 32u; ++l) {
+                            const uint is  = l / 16u;
+                            const uint a   = byteAt(ql0 + l);
+                            const uint bq  = byteAt(ql0 + l + 32u);
+                            const uint h   = byteAt(qh0 + l);
+
+                            int q1 = int((a  & 0x0Fu) | (((h >> 0u) & 3u) << 4u)) - 32;
+                            int q2 = int((bq & 0x0Fu) | (((h >> 2u) & 3u) << 4u)) - 32;
+                            int q3 = int((a  >> 4u)   | (((h >> 4u) & 3u) << 4u)) - 32;
+                            int q4 = int((bq >> 4u)   | (((h >> 6u) & 3u) << 4u)) - 32;
+
+                            const float w1 = (halfsel == 0u)
+                                ? d * float(s8At(sc0 + is + 0u)) * float(q1)
+                                : d * float(s8At(sc0 + is + 4u)) * float(q3);
+                            const float w2 = (halfsel == 0u)
+                                ? d * float(s8At(sc0 + is + 2u)) * float(q2)
+                                : d * float(s8At(sc0 + is + 6u)) * float(q4);
+
+                            for (int t = 0; t < 16; ++t) {
+                                acc[t] += w1 * xs[t][l] + w2 * xs[t][l + 32u];
+                            }
+                        }
+                    }
+                }
+                barrier();
+            }
+        }
+
+        if (row_ok) {
+            for (int t = 0; t < 16; ++t) {
+                const uint ti = t0 + uint(t);
+                if (ti < pc.n_tokens) {
+                    y[ti * pc.ne1 + row] = acc[t];
+                }
+            }
+        }
+    }
+}

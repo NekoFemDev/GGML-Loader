@@ -1,0 +1,43 @@
+#version 450
+
+// y[row] = dot(W[row][0..ne0-1], x)
+// One invocation per output row, as requested. For large ne1 this is
+// memory-bound on Mali; see matmul_quant.comp for the perf notes.
+
+layout(local_size_x = 64) in;
+
+// All 64 invocations in a workgroup read the same x, so stage it once.
+shared float xs[4096];
+
+layout(std430, binding = 0) readonly  buffer W { float w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint ne0;
+    uint ne1;
+    uint type;   // 0 = f32
+    uint x_off;  // token row offset, in floats
+    uint y_off;  // output row offset, in floats
+    uint pad;
+} pc;
+
+void main()
+{
+    for (uint i = gl_LocalInvocationID.x; i < pc.ne0; i += 64u) {
+        xs[i] = x[pc.x_off + i];
+    }
+    barrier();
+
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.ne1) {
+        return;
+    }
+
+    uint base = row * pc.ne0;
+    float acc = 0.0;
+    for (uint i = 0; i < pc.ne0; ++i) {
+        acc += w[base + i] * xs[i];
+    }
+    y[pc.y_off + row] = acc;
+}
