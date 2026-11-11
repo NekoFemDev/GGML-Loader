@@ -1,0 +1,238 @@
+#version 450
+
+// Quantised-weight GEMV: y[row] = dot(dequant(W[row]), x)
+//
+// W stays quantised in VRAM (q4_K 144 B / 256 weights, q5_K 176 B, q6_K 210 B).
+// The shader decodes each 256-element block into registers as it walks the row,
+// so the host never materialises an f32 copy.
+//
+// Performance note: this is the correctness reference. It reads the weight
+// buffer byte-at-a-time, which on Mali costs one transaction per byte per
+// invocation. The fast version reads 32-bit words, uses one workgroup per row
+// and cooperatively reduces over 256 elements. Keep this one as the oracle.
+
+layout(local_size_x = 64) in;
+
+
+layout(std430, binding = 0) readonly  buffer W { uint  w[]; };
+layout(std430, binding = 1) readonly  buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+
+layout(push_constant) uniform PC {
+    uint ne0;
+    uint ne1;
+    uint type;   // 12 = q4_K, 13 = q5_K, 14 = q6_K
+    uint x_off;  // token row offset, in floats
+    uint y_off;  // output row offset, in floats
+    uint pad;
+} pc;
+
+uint byteAt(uint off)
+{
+    return (w[off >> 2] >> ((off & 3u) * 8u)) & 0xFFu;
+}
+
+// Unaligned 32-bit read. q4_K (144 B) and q5_K (176 B) blocks are 4-byte
+// aligned so they can index w[] directly; q6_K is 210 B, so odd blocks start
+// at offset % 4 == 2 and a direct word read returns shifted bytes.
+uint u32At(uint off)
+{
+    uint sh  = (off & 3u) * 8u;
+    uint idx = off >> 2u;
+    uint lo  = w[idx] >> sh;
+    uint hi  = sh == 0u ? 0u : (w[idx + 1u] << (32u - sh));
+    return lo | hi;
+}
+
+uint u16At(uint off)
+{
+    return byteAt(off) | (byteAt(off + 1u) << 8u);
+}
+
+float f16At(uint off)
+{
+    // low half of the packed pair
+    return unpackHalf2x16(u16At(off)).x;
+}
+
+int s8At(uint off)
+{
+    int v = int(byteAt(off));
+    return v >= 128 ? v - 256 : v;
+}
+
+// 6-bit scale/min unpacking, identical to ggml's get_scale_min_k4().
+void getScaleMin(uint j, uint base, out uint d, out uint m)
+{
+    if (j < 4u) {
+        d = byteAt(base + j) & 63u;
+        m = byteAt(base + j + 4u) & 63u;
+    } else {
+        d = (byteAt(base + j + 4u) & 0x0Fu) | ((byteAt(base + j - 4u) >> 6u) << 4u);
+        m = (byteAt(base + j + 4u) >> 4u)    | ((byteAt(base + j)      >> 6u) << 4u);
+    }
+}
+
+// Read the quant payload as 32-bit words: one load feeds 8 elements for
+// q4_K, 4 for q6_K. This is the difference between 14 ms and ~4 ms on a G615.
+float dot_q4k(uint rowbase, uint xbase)
+{
+    float acc = 0.0;
+    uint  nb  = pc.ne0 / 256u;
+
+    for (uint b = 0u; b < nb; ++b) {
+        uint  off  = rowbase + b * 144u;
+        float d    = f16At(off);
+        float dmin = f16At(off + 2u);
+        uint  sc   = off + 4u;
+        uint  qs   = off + 16u;
+
+        for (uint j = 0u; j < 4u; ++j) {
+            uint s0, m0, s1, m1;
+            getScaleMin(j * 2u,      sc, s0, m0);
+            getScaleMin(j * 2u + 1u, sc, s1, m1);
+
+            float d1  = d * float(s0);
+            float mm1 = dmin * float(m0);
+            float d2  = d * float(s1);
+            float mm2 = dmin * float(m1);
+
+            uint xi = xbase + b * 256u + j * 64u;
+            uint qb = qs + j * 32u;
+
+            for (uint k = 0u; k < 8u; ++k) {
+                uint qw = w[(qb + k * 4u) >> 2u];
+                uint e  = xi + k * 4u;
+
+                acc += (d1 * float( qw        & 0x0Fu) - mm1) * x[pc.x_off + e + 0u];
+                acc += (d1 * float((qw >>  8u) & 0x0Fu) - mm1) * x[pc.x_off + e + 1u];
+                acc += (d1 * float((qw >> 16u) & 0x0Fu) - mm1) * x[pc.x_off + e + 2u];
+                acc += (d1 * float((qw >> 24u) & 0x0Fu) - mm1) * x[pc.x_off + e + 3u];
+
+                acc += (d2 * float((qw >>  4u) & 0x0Fu) - mm2) * x[pc.x_off + e + 32u + 0u];
+                acc += (d2 * float((qw >> 12u) & 0x0Fu) - mm2) * x[pc.x_off + e + 32u + 1u];
+                acc += (d2 * float((qw >> 20u) & 0x0Fu) - mm2) * x[pc.x_off + e + 32u + 2u];
+                acc += (d2 * float((qw >> 28u) & 0x0Fu) - mm2) * x[pc.x_off + e + 32u + 3u];
+            }
+        }
+    }
+    return acc;
+}
+
+float dot_q5k(uint rowbase, uint xbase)
+{
+    float acc = 0.0;
+    uint  nb  = pc.ne0 / 256u;
+
+    for (uint b = 0u; b < nb; ++b) {
+        uint  off  = rowbase + b * 176u;
+        float d    = f16At(off);
+        float dmin = f16At(off + 2u);
+        uint  sc   = off + 4u;
+        uint  qh   = off + 16u;
+        uint  ql   = off + 48u;
+
+        uint u1 = 1u, u2 = 2u;
+        for (uint j = 0u; j < 4u; ++j) {
+            uint s0, m0, s1, m1;
+            getScaleMin(j * 2u,      sc, s0, m0);
+            getScaleMin(j * 2u + 1u, sc, s1, m1);
+
+            float d1  = d * float(s0);
+            float mm1 = dmin * float(m0);
+            float d2  = d * float(s1);
+            float mm2 = dmin * float(m1);
+
+            uint xi  = xbase + b * 256u + j * 64u;
+            uint qlb = ql + j * 32u;
+
+            for (uint k = 0u; k < 8u; ++k) {
+                uint qw = w[(qlb + k * 4u) >> 2u];
+                uint hw = w[(qh  + k * 4u) >> 2u];
+                uint e  = xi + k * 4u;
+
+                for (uint t = 0u; t < 4u; ++t) {
+                    uint q  = (qw >> (8u * t)) & 0xFFu;
+                    uint hb = (hw >> (8u * t)) & 0xFFu;
+
+                    uint lo = (q & 0x0Fu) + ((hb & u1) != 0u ? 16u : 0u);
+                    uint hi = (q >> 4u)   + ((hb & u2) != 0u ? 16u : 0u);
+
+                    acc += (d1 * float(lo) - mm1) * x[pc.x_off + e + t];
+                    acc += (d2 * float(hi) - mm2) * x[pc.x_off + e + 32u + t];
+                }
+            }
+            u1 <<= 2u;
+            u2 <<= 2u;
+        }
+    }
+    return acc;
+}
+
+float dot_q6k(uint rowbase, uint xbase)
+{
+    float acc = 0.0;
+    uint  nb  = pc.ne0 / 256u;
+
+    for (uint b = 0u; b < nb; ++b) {
+        uint  off = rowbase + b * 210u;
+        uint  ql  = off;
+        uint  qh  = off + 128u;
+        uint  sc  = off + 192u;
+        float d   = f16At(off + 208u);
+
+        for (uint n = 0u; n < 2u; ++n) {
+            uint xb2 = xbase + b * 256u + n * 128u;
+            uint ql0 = ql + n * 64u;
+            uint qh0 = qh + n * 32u;
+            uint sc0 = sc + n * 8u;
+
+            for (uint lw = 0u; lw < 8u; ++lw) {
+                uint a  = u32At(ql0 + lw * 4u);
+                uint bq = u32At(ql0 + 32u + lw * 4u);
+                uint h  = u32At(qh0 + lw * 4u);
+
+                for (uint t = 0u; t < 4u; ++t) {
+                    uint l   = lw * 4u + t;
+                    uint is  = l / 16u;
+                    uint qlb0 = (a  >> (8u * t)) & 0xFFu;
+                    uint qlb1 = (bq >> (8u * t)) & 0xFFu;
+                    uint qhb  = (h  >> (8u * t)) & 0xFFu;
+
+                    int q1 = int((qlb0 & 0x0Fu) | (((qhb >> 0u) & 3u) << 4u)) - 32;
+                    int q2 = int((qlb1 & 0x0Fu) | (((qhb >> 2u) & 3u) << 4u)) - 32;
+                    int q3 = int((qlb0 >> 4u)   | (((qhb >> 4u) & 3u) << 4u)) - 32;
+                    int q4 = int((qlb1 >> 4u)   | (((qhb >> 6u) & 3u) << 4u)) - 32;
+
+                    acc += d * float(s8At(sc0 + is + 0u)) * float(q1) * x[pc.x_off + xb2 + l];
+                    acc += d * float(s8At(sc0 + is + 2u)) * float(q2) * x[pc.x_off + xb2 + 32u + l];
+                    acc += d * float(s8At(sc0 + is + 4u)) * float(q3) * x[pc.x_off + xb2 + 64u + l];
+                    acc += d * float(s8At(sc0 + is + 6u)) * float(q4) * x[pc.x_off + xb2 + 96u + l];
+                }
+            }
+        }
+    }
+    return acc;
+}
+
+void main()
+{
+    uint row = gl_GlobalInvocationID.x;
+    if (row >= pc.ne1) {
+        return;
+    }
+
+    uint block_bytes = pc.type == 12u ? 144u : (pc.type == 13u ? 176u : 210u);
+    uint row_bytes   = (pc.ne0 / 256u) * block_bytes;
+    uint rb          = row * row_bytes;
+
+    float acc;
+    if (pc.type == 12u) {
+        acc = dot_q4k(rb, 0u);
+    } else if (pc.type == 13u) {
+        acc = dot_q5k(rb, 0u);
+    } else {
+        acc = dot_q6k(rb, 0u);
+    }
+    y[pc.y_off + row] = acc;
+}

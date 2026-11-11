@@ -61,6 +61,23 @@ void calculate_optimal_cache(size_t total_ram, int *out_cache_mb, int *out_ctx_l
         usable = 512ull * 1024 * 1024;   /* floor; caller's tracker will warn */
     }
 
+    /* Preferred profile when the device can afford it: 1800 MiB of experts
+     * (631 slots) and 4096 tokens of context. This shifts the budget from the
+     * rarely-used long context toward the expert cache, which is what decode
+     * actually benefits from. */
+    const size_t PREF_CACHE = 1800ull * 1024 * 1024;
+    const size_t PREF_KV    = 4096ull * MOE_KV_BYTES_PER_TOKEN;
+    if (cap_usable >= PREF_CACHE + PREF_KV &&
+        avail >= MOE_OS_RESERVE_BYTES + PREF_CACHE + PREF_KV) {
+        *out_cache_mb = 1800;
+        *out_ctx_len  = 4096;
+        fprintf(stderr,
+                "[autotune] preferred profile: cache 1800 MiB, ctx 4096 "
+                "(avail %zu MiB, cap %zu MiB)\n",
+                avail / (1024 * 1024), cap / (1024 * 1024));
+        return;
+    }
+
     size_t cache_bytes = usable / 2;
     size_t kv_bytes    = usable - cache_bytes;
 

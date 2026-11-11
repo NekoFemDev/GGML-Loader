@@ -48,7 +48,7 @@ static void usage(void)
         "  --backend vulkan|cpu   math backend (default vulkan)\n"
         "  --cache-mb N           expert cache MiB (default: auto)\n"
         "  --ctx N                context length   (default: auto)\n"
-        "  --threads N            I/O workers      (default 4)\n"
+        "  --threads N            I/O workers      (default 6)\n"
         "  --max-new N            max tokens per reply (default 512)\n"
         "  --system \"...\"         system prompt\n"
         "  --no-direct            disable O_DIRECT\n"
@@ -69,7 +69,7 @@ int main(int argc, char **argv)
     const char *backend    = "vulkan";
     int         cache_mb   = 0;
     int         ctx_len    = 0;
-    int         threads    = 4;
+    int         threads    = 6;
     int         max_new    = 512;
     int         no_direct  = 0;
     int         debug      = 0;
@@ -86,7 +86,7 @@ int main(int argc, char **argv)
         } else if (!strcmp(a, "--ctx") && i + 1 < argc) {
             ctx_len = parse_int(argv[++i], 0);
         } else if (!strcmp(a, "--threads") && i + 1 < argc) {
-            threads = parse_int(argv[++i], 4);
+            threads = parse_int(argv[++i], 6);
         } else if (!strcmp(a, "--max-new") && i + 1 < argc) {
             max_new = parse_int(argv[++i], 512);
         } else if (!strcmp(a, "--system") && i + 1 < argc) {

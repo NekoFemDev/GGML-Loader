@@ -514,3 +514,54 @@ when prefill becomes a true large-M GEMM.
   needed or performed.
 - Shader changes still require `shaders/build.sh`; `compute_vulkan.o` depends on
   `vulkan_shaders.h`, so `make` rebuilds it.
+
+---
+
+# Phase 4 — decode experiments
+
+## lm_head residency (shipped)
+
+`sync_matmul()` now takes `wkey` and resolves the weight through the keyed
+cache. `lm_head` is 255 MiB (`ne1 = 151936`, larger than a batch slot), so it
+used to take the synchronous path and `memcpy` all 255 MiB into the staging
+buffer **every token**. It is now uploaded once; the staging buffers are used
+only for x and y.
+
+## Coalesced GEMV (shipped, gated, slower)
+
+`matmul_coalesced.comp` maps a workgroup to 8 groups x 8 lanes. Group g walks
+8 rows; lanes read consecutive 256-element blocks, and `x` is staged once per
+64 rows. Numerically correct (max rel 4e-7).
+
+End-to-end it loses:
+
+| variant | decode @ 1024/2048 | 4.5 MiB matmul |
+|---|---|---|
+| row-per-invocation (default) | **0.78–0.86 tok/s** | 9.5 ms |
+| coalesced 8x8 | 0.65–0.69 tok/s | 7.3 ms |
+| no-shared x (diagnostic) | 0.78–0.82 tok/s | 8.2 ms |
+
+The microbench favours coalescing but includes a 4.5 MiB upload and does not
+reflect the real dispatch mix (many small `ne1` matmuls, cached weights).
+The no-shared variant removes all 16 KiB of shared memory and measures the
+same as the row shader, which rules out occupancy as the limiter. The
+conclusion is that this GEMV is **latency/instruction bound**, not DRAM
+bandwidth bound; coalescing reduces the number of independent row streams
+without improving the resource that is actually saturated.
+
+Both variants stay behind `MOE_VK_COALESCED=1` / `MOE_VK_NOSHARED=1`; the row
+shader remains the default.
+
+## Autotune and threads (shipped)
+
+- `calculate_optimal_cache()` prefers **1800 MiB cache / 4096 ctx** when
+  `cap_usable` and `MemAvailable` allow it, otherwise falls back to the 50/50
+  split.
+- CLI and test harness default to `--threads 6`.
+
+## Net result
+
+Decode went from 0.61 tok/s (auto 1100/5871, 4 threads, lm_head re-uploaded)
+to **0.72–0.86 tok/s** at a fixed 1024/2048 budget (best observed 0.86). The
+1.8 tok/s target was not reached; the remaining gap is kernel-bound, and the
+three tiling/occupancy attempts each lost to the simple row shader on this GPU.

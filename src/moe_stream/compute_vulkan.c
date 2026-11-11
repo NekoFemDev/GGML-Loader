@@ -89,6 +89,8 @@ typedef struct {
     VkPipeline            pipe_f32;
     VkPipeline            pipe_q;
     VkPipeline            pipe_gemm;
+    VkPipeline            pipe_coal;
+    VkPipeline            pipe_noshared;
 
     /* per-slot staging for batched dispatches */
     VkBuffer       xbuf;
@@ -129,6 +131,8 @@ typedef struct {
 } vk_state_t;
 
 static vk_state_t g_vk;
+static int g_coalesced = -1;   /* MOE_VK_COALESCED */
+static int g_noshared  = -1;   /* MOE_VK_NOSHARED  */
 
 /* One host-visible VkBuffer shared by the expert LRU and the GPU. The streamer
  * pread()s directly into this mapping, so there is no host copy and no upload. */
@@ -498,8 +502,17 @@ static int vk_init(vk_state_t *s)
     s->pipe_f32  = build_pipeline(s, matmul_f32_spv, matmul_f32_spv_len);
     s->pipe_q    = build_pipeline(s, matmul_quant_spv, matmul_quant_spv_len);
     s->pipe_gemm = build_pipeline(s, matmul_gemm_spv, matmul_gemm_spv_len);
-    if (!s->pipe_f32 || !s->pipe_q || !s->pipe_gemm) {
+    s->pipe_coal = build_pipeline(s, matmul_coalesced_spv, matmul_coalesced_spv_len);
+    s->pipe_noshared = build_pipeline(s, matmul_noshared_spv, matmul_noshared_spv_len);
+    if (!s->pipe_f32 || !s->pipe_q || !s->pipe_gemm || !s->pipe_coal ||
+        !s->pipe_noshared) {
         return -1;
+    }
+    if (g_coalesced < 0) {
+        g_coalesced = getenv("MOE_VK_COALESCED") != NULL;
+        g_noshared = getenv("MOE_VK_NOSHARED") != NULL;
+        fprintf(stderr, "[vk] GEMV variant: %s\n",
+                g_noshared ? "no-shared-x" : (g_coalesced ? "coalesced" : "row"));
     }
 
     VkDescriptorPoolSize dps = {
@@ -539,6 +552,21 @@ static int vk_init(vk_state_t *s)
         make_buffer(s, (VkDeviceSize)VK_MAX_BATCH * VK_BYSTRIDE, &s->bybuf,
                     &s->bymem, &s->bymap) != 0) {
         return -1;
+    }
+
+    if (getenv("MOE_VK_MEMINFO")) {
+        VkPhysicalDeviceMemoryProperties mp;
+        vkGetPhysicalDeviceMemoryProperties(s->phys, &mp);
+        for (uint32_t i = 0; i < mp.memoryTypeCount; i++) {
+            fprintf(stderr, "[vk] memtype %u flags=0x%02x heap=%u\n", i,
+                    mp.memoryTypes[i].propertyFlags,
+                    mp.memoryTypes[i].heapIndex);
+        }
+        for (uint32_t i = 0; i < mp.memoryHeapCount; i++) {
+            fprintf(stderr, "[vk] heap %u size=%llu MiB flags=0x%02x\n", i,
+                    (unsigned long long)(mp.memoryHeaps[i].size / (1024 * 1024)),
+                    mp.memoryHeaps[i].flags);
+        }
     }
 
     s->state = 1;
@@ -774,6 +802,19 @@ static int bind_slot(vk_state_t *s, int slot, VkBuffer wbuf, VkDeviceSize woff,
     return 0;
 }
 
+static VkPipeline pick_gemv_pipe(vk_state_t *s, uint32_t type)
+{
+    if (type != GGML_T_F32) {
+        if (g_noshared > 0 && s->pipe_noshared) {
+            return s->pipe_noshared;
+        }
+        if (g_coalesced > 0 && s->pipe_coal) {
+            return s->pipe_coal;
+        }
+    }
+    return (type == GGML_T_F32) ? s->pipe_f32 : s->pipe_q;
+}
+
 static int record_dispatch(vk_state_t *s, int slot,
                            uint32_t type, uint64_t ne0, uint64_t ne1,
                            uint32_t x_off, uint32_t y_off)
@@ -782,7 +823,7 @@ static int record_dispatch(vk_state_t *s, int slot,
         uint32_t ne0, ne1, type, x_off, y_off, pad;
     } pc = { (uint32_t)ne0, (uint32_t)ne1, type, x_off, y_off, 0 };
 
-    VkPipeline pipe = (type == GGML_T_F32) ? s->pipe_f32 : s->pipe_q;
+    VkPipeline pipe = pick_gemv_pipe(s, type);
 
     vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
     vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -814,24 +855,39 @@ static int ensure_sbuf(vk_state_t *s, int i, size_t need)
 }
 
 static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
-                        uint64_t ne0, uint64_t ne1, const float *x, float *y)
+                        uint64_t wkey, uint64_t ne0, uint64_t ne1,
+                        const float *x, float *y)
 {
     const size_t wbytes = (size_t)ggml_type_row_bytes(type, ne0) * (size_t)ne1;
     const size_t xbytes = (size_t)ne0 * sizeof(float);
     const size_t ybytes = (size_t)ne1 * sizeof(float);
 
-    if (ensure_sbuf(s, 0, wbytes) != 0 ||
-        ensure_sbuf(s, 1, xbytes) != 0 ||
+    if (ensure_sbuf(s, 1, xbytes) != 0 ||
         ensure_sbuf(s, 2, ybytes) != 0) {
         fallback_matmul(type, w, ne0, ne1, x, y);
         return;
     }
 
-    memcpy(s->smap[0], w, wbytes);
+    /* lm_head is 255 MiB: upload it once through the keyed cache instead of
+     * copying it into the staging buffer on every token. */
+    VkBuffer     wbuf = VK_NULL_HANDLE;
+    VkDeviceSize woff = 0;
+    if (wkey != 0) {
+        wbuf = cache_get(s, wkey, w, wbytes);
+    }
+    if (wbuf == VK_NULL_HANDLE) {
+        if (ensure_sbuf(s, 0, wbytes) != 0) {
+            fallback_matmul(type, w, ne0, ne1, x, y);
+            return;
+        }
+        memcpy(s->smap[0], w, wbytes);
+        wbuf = s->sbuf[0];
+    }
+
     memcpy(s->smap[1], x, xbytes);
 
     VkDescriptorBufferInfo info[3] = {
-        { s->sbuf[0], 0, VK_WHOLE_SIZE },
+        { wbuf, woff, VK_WHOLE_SIZE },
         { s->sbuf[1], 0, VK_WHOLE_SIZE },
         { s->sbuf[2], 0, VK_WHOLE_SIZE },
     };
@@ -860,7 +916,7 @@ static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
     };
     vkBeginCommandBuffer(s->cmd, &bi);
     vkCmdBindPipeline(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      type == GGML_T_F32 ? s->pipe_f32 : s->pipe_q);
+                      pick_gemv_pipe(s, type));
     vkCmdBindDescriptorSets(s->cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                             s->playout, 0, 1, &s->dset[VK_MAX_BATCH], 0, NULL);
     vkCmdPushConstants(s->cmd, s->playout, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -909,14 +965,14 @@ static void vk_matmul(void *self, uint32_t type, const uint8_t *w, uint64_t wkey
         if (s->in_batch) {
             vk_end_batch(s);
         }
-        sync_matmul(s, type, w, ne0, ne1, x, y);
+        sync_matmul(s, type, w, wkey, ne0, ne1, x, y);
         return;
     }
     if (wkey == 0 || g_no_batch > 0) {
         if (s->in_batch) {
             vk_end_batch(s);
         }
-        sync_matmul(s, type, w, ne0, ne1, x, y);
+        sync_matmul(s, type, w, wkey, ne0, ne1, x, y);
         return;
     }
 
