@@ -530,10 +530,36 @@ static void attention_block(struct qwen_model *m, qwen_layer_t *L, int layer,
     }
 }
 
+/* The router is 128x2048 f32: ~0.26 MMAC, cheaper on the CPU than a GPU
+ * dispatch plus a fence. Removing it also frees its 1 MiB/layer from VRAM. */
+static void router_dot(const mtensor_t *t, const float *x, float *y)
+{
+    const uint64_t ne0 = t->ne0;
+    const uint64_t ne1 = t->ne1;
+    const float   *w   = (const float *)t->data;
+
+    for (uint64_t o = 0; o < ne1; o++) {
+        const float *row = w + o * ne0;
+        float acc = 0.0f;
+        for (uint64_t i = 0; i < ne0; i++) {
+            acc += row[i] * x[i];
+        }
+        y[o] = acc;
+    }
+}
+
 static void moe_route(struct qwen_model *m, qwen_layer_t *L, const float *xbn,
                       uint32_t *ids, float *w)
 {
-    mt_mul(m, &L->ffn_gate_inp, xbn, m->router);
+    static int g_cpu_router = -1;
+    if (g_cpu_router < 0) {
+        g_cpu_router = getenv("MOE_GPU_ROUTER") == NULL;
+    }
+    if (g_cpu_router && L->ffn_gate_inp.type == GGML_T_F32) {
+        router_dot(&L->ffn_gate_inp, xbn, m->router);
+    } else {
+        mt_mul(m, &L->ffn_gate_inp, xbn, m->router);
+    }
     m->be->softmax(m->be->self, m->router, m->n_expert);
 
     for (int k = 0; k < m->top_k; k++) {

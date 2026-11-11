@@ -143,6 +143,35 @@ typedef struct {
     char name[256];
 } vk_state_t;
 
+/* Bounded busy-wait: a compute batch is 2-4 ms, so spinning for up to 1.5 ms
+ * often catches completion without the kernel's blocking-wait latency. */
+static double vk_now_ms(void);
+
+static int vk_wait_fence(vk_state_t *s)
+{
+    static int g_spin = -1;
+    if (g_spin < 0) {
+        g_spin = getenv("MOE_NO_SPIN") == NULL;
+    }
+    if (g_spin) {
+        const double t0 = vk_now_ms();
+        for (int i = 0;; i++) {
+            const VkResult r = vkGetFenceStatus(s->dev, s->fence);
+            if (r == VK_SUCCESS) {
+                return 0;
+            }
+            if (r != VK_NOT_READY) {
+                return -1;
+            }
+            if ((i & 255) == 0 && vk_now_ms() - t0 > 1.5) {
+                break;
+            }
+        }
+    }
+    return vkWaitForFences(s->dev, 1, &s->fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS
+        ? 0 : -1;
+}
+
 static double vk_now_ms(void)
 {
     struct timespec ts;
@@ -792,7 +821,7 @@ static int vk_end_batch(void *self)
         .pCommandBuffers    = &s->cmd,
     };
     if (vkQueueSubmit(s->queue, 1, &si, s->fence) != VK_SUCCESS ||
-        vkWaitForFences(s->dev, 1, &s->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        vk_wait_fence(s) != 0) {
         s->in_batch = 0;
         s->state    = -1;
         return -1;
@@ -1006,7 +1035,7 @@ static void sync_matmul(vk_state_t *s, uint32_t type, const uint8_t *w,
         .pCommandBuffers    = &s->cmd,
     };
     if (vkQueueSubmit(s->queue, 1, &si, s->fence) != VK_SUCCESS ||
-        vkWaitForFences(s->dev, 1, &s->fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+        vk_wait_fence(s) != 0) {
         s->state = -1;
         fallback_matmul(type, w, ne0, ne1, x, y);
         return;

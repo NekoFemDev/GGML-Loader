@@ -624,3 +624,41 @@ threads; more latency hiding does not help. Kept behind `MOE_VK_WG128=1`.
    16-token variants all lost to the row shader; the next candidate needs a
    different decomposition (e.g. one workgroup per row with a subgroup
    reduction), not another tiling of the same mapping.
+
+---
+
+# Phase 6 — CPU router and bounded fence spin
+
+## CPU router (default, `MOE_GPU_ROUTER=1` to disable)
+
+`ffn_gate_inp` is 128x2048 f32 — about 0.26 MMAC. Dispatching it to the GPU cost
+a submit/fence per layer (48 per token) and kept 1 MiB/layer resident in VRAM.
+It now runs on the CPU (`router_dot()`), which also frees ~48 MiB of the keyed
+cache. Alone it is close to neutral: the saved fence is partly paid back in CPU
+time, but the freed VRAM and 20% fewer batches help the rest of the pipeline.
+
+## Bounded fence spin (default, `MOE_NO_SPIN=1` to disable)
+
+`vk_wait_fence()` spins on `vkGetFenceStatus` for up to 1.5 ms before falling
+back to blocking `vkWaitForFences`. A compute batch is 2–4 ms, so the spin often
+catches completion without the driver's wait latency.
+
+## A/B, six generated tokens, three paired trials
+
+| config | decode |
+|---|---|
+| GPU router + blocking wait | 0.85, 0.88, 0.85 tok/s |
+| CPU router + spin (default) | 0.96, 0.95, 0.92 tok/s |
+
+**+9.6%**, inside the 8–12% estimate.
+
+Profile for the same six tokens:
+
+| | batches | gpu | submit/wait | record |
+|---|---|---|---|---|
+| before | 1687 | 3700 ms (62%) | 1734 ms (29%) | 552 ms (9%) |
+| after | 1351 | 3801 ms (63%) | 1680 ms (28%) | 544 ms (9%) |
+
+Batches fall 20% (the router dispatches are gone). The submit total barely
+moves, yet wall time improves by ~0.5 s; the gain is fewer fence round-trips
+and better overlap with the I/O workers, which GPU timestamps do not capture.
