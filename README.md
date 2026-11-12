@@ -9,6 +9,10 @@ specifically.
 **Status: early, but the CPU/Vulkan text-inference path is real now, not just a stub. The
 Mali-specific GPU backend -- this project's actual reason to exist -- still hasn't been started.**
 
+**MoE track:** `src/moe_stream` is a separate **pure-C** engine for sparse MoE models
+(Qwen3-30B-A3B), developed on the **`moe`** branch. It shares no code with the C++ loader above
+and does not depend on ggml. See the section below.
+
 ## What's actually here right now
 
 - A from-scratch forward pass for four gguf architectures -- **phi3, qwen2, qwen3, llama** --
@@ -200,27 +204,86 @@ working tree, not upstream):
   verified bit-for-bit identical output against `--backend vulkan` (unaffected by the bug) and
   against the other already-working models before/after the patch.
 
-## MoE engine (`src/moe_stream`)
+## MoE engine (`src/moe_stream`, `moe` branch)
 
-A self-contained C implementation for sparse MoE models (validated with
-Qwen3-30B-A3B), separate from the dense ggml path above:
+A self-contained **pure-C** inference path for sparse MoE models. The dense loader above is
+C++/CMake; this engine and its CLI are independent of it and of ggml.
 
-- expert streaming from GGUF with `pread`/`O_DIRECT`, byte-budgeted LRU with
-  TinyLFU admission
-- q4_K / q5_K / q6_K dequantisation on the fly; scalar and Vulkan backends
-- layer-sweep prefill (each expert read once per layer, applied to all routed tokens)
-- host/GPU-shared expert arena (one mapped Vulkan buffer, no upload copies)
-- memory tracker with a hard cap and a clean `[OOM]` failure instead of an LMK kill
-- ChatML CLI with automatic context/cache sizing from `MemAvailable`
+Validated models:
+
+| model | size | notes |
+|---|---|---|
+| Qwen3-Coder-30B-A3B-Instruct UD-Q4_K_XL | 16.8 GB | code/chat; 48 layers, 128 experts, top-8 |
+| Qwen3-30B-A3B UD-Q2_K_XL | 11.8 GB | **base** model (not instruction-tuned); completion only |
+
+Supported blocks: **q2_K, q3_K, q4_K, q5_K, q6_K** plus f32/f16. Unsloth dynamic quants mix
+types per tensor (e.g. q4_K attention, q5_K `ffn_down_exps` on some layers, q2_K/q3_K experts).
+
+### What it does
+
+- **Expert streaming** from GGUF with `pread` / `O_DIRECT`; byte-budgeted LRU with **TinyLFU**
+  admission so tail misses do not evict hot experts.
+- **Layer-sweep prefill**: each routed expert is read once per layer and applied to all tokens
+  routed to it, batched across an expert chunk.
+- **Scalar and Vulkan** compute backends. Vulkan records all dispatches of a group into one
+  command buffer and submits once.
+- **Keyed VRAM cache** for resident weights plus a single **host/GPU-shared expert arena**: the
+  streamer reads directly into the mapped `VkBuffer`, so there is no upload copy.
+- **Memory tracker** with a 4.5 GiB process cap and a clean `[OOM]` failure instead of an LMK
+  kill. Autotune reads `MemAvailable`, reserves 2 GiB for the OS, splits the rest 50/50
+  between experts and KV, and prefers 1800 MiB cache / 4096 ctx when it fits.
+- **VkQueryPool profiling**: gpu / submit-wait / record-upload per batch.
+- CPU router and a bounded fence spin (both measurable wins at decode granularity).
+- **ChatML CLI**: streaming tokens, `/reset`, `/exit`, stop on `<|im_end|>` or `<|endoftext|>`,
+  `--no-think` for Qwen3 Instruct models.
+
+### Build and run
 
 ```sh
 cd src/moe_stream
-make VULKAN=1 all
-./build/moe_chat model.gguf --backend vulkan
+make -j4 VULKAN=1 all
+./build/moe_chat <model.gguf> --backend vulkan
 ```
 
-`--ctx` and `--cache-mb` default to `calculate_optimal_cache()`; override them
-for a tighter budget. See `MEMORY.md`, `VULKAN.md`, and `moe_c_plan.md`.
+`make vulkan` (clean + rebuild) is the safe target after switching backends, because CFLAGS
+are not tracked per object.
+
+Flags:
+
+| flag | meaning |
+|---|---|
+| `--backend vulkan\|cpu` | math backend (default vulkan) |
+| `--cache-mb N` | expert cache MiB (0 = auto) |
+| `--ctx N` | context length (0 = auto) |
+| `--threads N` | I/O workers (default 6) |
+| `--max-new N` | max tokens per reply (default 512) |
+| `--system "..."` | system prompt |
+| `--no-direct` | disable O_DIRECT |
+| `--no-think` | Qwen3: append the empty ` block (enable_thinking=false) |
+| `--debug` | tokenizer diagnostics |
+
+### Performance (12 GB phone, Q4_K_XL, 4.5 GiB cap)
+
+| phase | measured |
+|---|---|
+| prefill, 25-token prompt | 14–20 s |
+| decode, short burst | 0.92–0.96 tok/s |
+| decode, sustained (33–93 tokens) | 0.76–0.85 tok/s |
+| Vulkan split during decode | ~67% gpu, ~24% fence, ~10% record |
+
+`Q2_K_XL` is a **memory** win, not a speed win: expert slots drop from 2.85 MB to 1.83 MB and
+the file from 16.8 GB to 11.8 GB, but decode is slightly slower (~0.81–0.85 tok/s) because the
+shader is instruction-bound rather than bandwidth-bound.
+
+Design notes and benchmarks: `src/moe_stream/MEMORY.md`, `VULKAN.md`, and `moe_c_plan.md`.
+
+### Known limits
+
+- No speculative decoding yet; the GEMV kernel is ~2/3 of decode and has resisted all tiling
+  variants tried on Mali-G615.
+- The standard `Qwen3-30B-A3B` is a base model; use the `-Instruct` variant or the Coder model
+  for chat.
+- KV cache is f32 (192 KiB/token); f16 would halve it.
 
 ## Usage
 
