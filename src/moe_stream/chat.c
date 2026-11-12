@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
 #include <time.h>
 
@@ -32,6 +33,21 @@
 #define COLOR_BOLD  "\033[1m"
 #define COLOR_DIM   "\033[2m"
 #define COLOR_OFF   "\033[0m"
+
+static int append(char *buf, int cap, int off, const char *fmt, ...)
+{
+    if (off < 0 || off >= cap) {
+        return -1;
+    }
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(buf + off, (size_t)(cap - off), fmt, ap);
+    va_end(ap);
+    if (n < 0 || n >= cap - off) {
+        return -1;
+    }
+    return off + n;
+}
 
 static double now_ms(void)
 {
@@ -52,7 +68,8 @@ static void usage(void)
         "  --max-new N            max tokens per reply (default 512)\n"
         "  --system \"...\"         system prompt\n"
         "  --no-direct            disable O_DIRECT\n"
-        "  --debug                tokenizer diagnostics\n");
+        "  --debug                tokenizer diagnostics\n"
+        "  --no-think             Qwen3: skip the <think> block\n");
 }
 
 static int parse_int(const char *s, int dflt)
@@ -73,6 +90,7 @@ int main(int argc, char **argv)
     int         max_new    = 512;
     int         no_direct  = 0;
     int         debug      = 0;
+    int         no_think   = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -95,6 +113,8 @@ int main(int argc, char **argv)
             no_direct = 1;
         } else if (!strcmp(a, "--debug")) {
             debug = 1;
+        } else if (!strcmp(a, "--no-think")) {
+            no_think = 1;
         } else if (a[0] != '-' && !model_path) {
             model_path = a;
         } else {
@@ -212,24 +232,32 @@ int main(int argc, char **argv)
             continue;
         }
 
-        int wrote;
+        /* Qwen3's template appends an empty  block when
+         * enable_thinking is false; without it the model reasons first. */
+        const char *asuf = no_think
+            ? "<|im_start|>assistant\n\n\n"
+            : "<|im_start|>assistant\n";
+
+        int wrote = 0;
         if (first) {
-            wrote = system
-                ? snprintf(prompt, PROMPT_MAX,
-                           "<|im_start|>system\n%s<|im_end|>\n"
-                           "<|im_start|>user\n%s<|im_end|>\n"
-                           "<|im_start|>assistant\n", system, line)
-                : snprintf(prompt, PROMPT_MAX,
-                           "<|im_start|>user\n%s<|im_end|>\n"
-                           "<|im_start|>assistant\n", line);
+            if (system) {
+                wrote = append(prompt, PROMPT_MAX, wrote,
+                               "<|im_start|>system\n%s<|im_end|>\n", system);
+            }
+            if (wrote >= 0) {
+                wrote = append(prompt, PROMPT_MAX, wrote,
+                               "<|im_start|>user\n%s<|im_end|>\n", line);
+            }
             first = 0;
         } else {
             /* The previous turn ended with <|im_end|> in the KV cache. */
-            wrote = snprintf(prompt, PROMPT_MAX,
-                             "\n<|im_start|>user\n%s<|im_end|>\n"
-                             "<|im_start|>assistant\n", line);
+            wrote = append(prompt, PROMPT_MAX, wrote,
+                           "\n<|im_start|>user\n%s<|im_end|>\n", line);
         }
-        if (wrote < 0 || wrote >= PROMPT_MAX) {
+        if (wrote >= 0) {
+            wrote = append(prompt, PROMPT_MAX, wrote, "%s", asuf);
+        }
+        if (wrote < 0) {
             fprintf(stderr, "prompt too long\n");
             continue;
         }

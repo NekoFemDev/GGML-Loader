@@ -59,6 +59,8 @@ static const char *type_name(uint32_t t)
 {
     switch (t) {
         case GGML_T_F32:  return "f32";
+        case GGML_T_Q2_K: return "q2_K";
+        case GGML_T_Q3_K: return "q3_K";
         case GGML_T_Q4_K: return "q4_K";
         case GGML_T_Q5_K: return "q5_K";
         case GGML_T_Q6_K: return "q6_K";
@@ -256,6 +258,8 @@ int main(int argc, char **argv)
 
     printf("\n[quantised rows, GPU vs vec_dot]\n");
     int ok = 1;
+    ok &= test_row(be, &io, &idx, GGML_T_Q2_K);
+    ok &= test_row(be, &io, &idx, GGML_T_Q3_K);
     ok &= test_row(be, &io, &idx, GGML_T_Q4_K);
     ok &= test_row(be, &io, &idx, GGML_T_Q5_K);
     ok &= test_row(be, &io, &idx, GGML_T_Q6_K);

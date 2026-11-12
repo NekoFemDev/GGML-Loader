@@ -59,6 +59,8 @@ size_t ggml_type_block_elems(uint32_t type)
     switch (type) {
         case GGML_T_F32:  return 1;
         case GGML_T_F16:  return 1;
+        case GGML_T_Q2_K: return QK_K;
+        case GGML_T_Q3_K: return QK_K;
         case GGML_T_Q4_K: return QK_K;
         case GGML_T_Q5_K: return QK_K;
         case GGML_T_Q6_K: return QK_K;
@@ -72,6 +74,8 @@ size_t ggml_type_block_bytes(uint32_t type)
     switch (type) {
         case GGML_T_F32:  return 4;
         case GGML_T_F16:  return 2;
+        case GGML_T_Q2_K: return 84;
+        case GGML_T_Q3_K: return 110;
         case GGML_T_Q4_K: return 144;
         case GGML_T_Q5_K: return 176;
         case GGML_T_Q6_K: return 210;
@@ -99,6 +103,86 @@ static inline void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t
     } else {
         *d = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
         *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+/* q2_K: 84 B = u8 scales[16], u8 qs[64], f16 d, f16 dmin */
+static void dequant_q2_K(const uint8_t *src, float *y)
+{
+    const float    d    = f16_to_f32(rd_u16(src + 80));
+    const float    dmin = f16_to_f32(rd_u16(src + 82));
+    const uint8_t *sc   = src;
+    const uint8_t *q    = src + 16;
+
+    int is = 0;
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            uint8_t s = sc[is++];
+            float dl = d * (float)(s & 0x0F);
+            float ml = dmin * (float)(s >> 4);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl * (float)((q[l] >> shift) & 3) - ml;
+            }
+
+            s = sc[is++];
+            dl = d * (float)(s & 0x0F);
+            ml = dmin * (float)(s >> 4);
+            for (int l = 0; l < 16; ++l) {
+                *y++ = dl * (float)((q[l + 16] >> shift) & 3) - ml;
+            }
+            shift += 2;
+        }
+        q += 32;
+    }
+}
+
+/* q3_K: 110 B = u8 hmask[32], u8 qs[64], u8 scales[12], f16 d */
+static void dequant_q3_K(const uint8_t *src, float *y)
+{
+    const uint32_t kmask1 = 0x03030303u;
+    const uint32_t kmask2 = 0x0f0f0f0fu;
+
+    const uint8_t *hm = src;
+    const uint8_t *q  = src + 32;
+
+    uint32_t a0, a1, a2;
+    memcpy(&a0, src + 96, 4);
+    memcpy(&a1, src + 100, 4);
+    memcpy(&a2, src + 104, 4);
+
+    const uint32_t tmp = a2;
+    a2 = ((a0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    const uint32_t a3 = ((a1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    a0 = (a0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    a1 = (a1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+
+    const uint32_t aux[4] = { a0, a1, a2, a3 };
+    const int8_t  *scales = (const int8_t *)aux;
+    const float    d_all  = f16_to_f32(rd_u16(src + 108));
+
+    uint8_t m  = 1;
+    int     is = 0;
+    for (int n = 0; n < QK_K; n += 128) {
+        int shift = 0;
+        for (int j = 0; j < 4; ++j) {
+            float dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) {
+                const int qv = (q[l] >> shift) & 3;
+                const int hv = (hm[l] & m) ? 0 : 4;
+                *y++ = dl * (float)(qv - hv);
+            }
+
+            dl = d_all * (float)(scales[is++] - 32);
+            for (int l = 0; l < 16; ++l) {
+                const int qv = (q[l + 16] >> shift) & 3;
+                const int hv = (hm[l + 16] & m) ? 0 : 4;
+                *y++ = dl * (float)(qv - hv);
+            }
+            shift += 2;
+            m = (uint8_t)(m << 1);
+        }
+        q += 32;
     }
 }
 
@@ -216,6 +300,20 @@ void dequant_row(uint32_t type, const uint8_t *src, float *dst, uint64_t n)
                 dst[i] = f16_to_f32(rd_u16(src + i * 2));
             }
             return;
+        case GGML_T_Q2_K: {
+            size_t bs = ggml_type_block_bytes(type);
+            for (uint64_t b = 0; b < n / QK_K; b++) {
+                dequant_q2_K(src + b * bs, dst + b * QK_K);
+            }
+            return;
+        }
+        case GGML_T_Q3_K: {
+            size_t bs = ggml_type_block_bytes(type);
+            for (uint64_t b = 0; b < n / QK_K; b++) {
+                dequant_q3_K(src + b * bs, dst + b * QK_K);
+            }
+            return;
+        }
         case GGML_T_Q4_K: {
             size_t bs = ggml_type_block_bytes(type);
             for (uint64_t b = 0; b < n / QK_K; b++) {
@@ -282,6 +380,8 @@ float vec_dot(uint32_t type, const uint8_t *row, const float *x, uint64_t n)
     for (uint64_t b = 0; b < nblk; b++) {
         const uint8_t *src = row + b * bs;
         switch (type) {
+            case GGML_T_Q2_K: dequant_q2_K(src, tmp); break;
+            case GGML_T_Q3_K: dequant_q3_K(src, tmp); break;
             case GGML_T_Q4_K: dequant_q4_K(src, tmp); break;
             case GGML_T_Q5_K: dequant_q5_K(src, tmp); break;
             case GGML_T_Q6_K: dequant_q6_K(src, tmp); break;

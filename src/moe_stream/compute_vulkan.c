@@ -902,11 +902,14 @@ static VkPipeline pick_gemv_pipe(vk_state_t *s, uint32_t type)
         if (g_wg128 > 0 && s->pipe_wg128) {
             return s->pipe_wg128;
         }
-        if (g_noshared > 0 && s->pipe_noshared) {
-            return s->pipe_noshared;
-        }
-        if (g_coalesced > 0 && s->pipe_coal) {
-            return s->pipe_coal;
+        /* the coalesced/no-shared variants only decode q4_K/q5_K/q6_K */
+        if (type == GGML_T_Q4_K || type == GGML_T_Q5_K || type == GGML_T_Q6_K) {
+            if (g_noshared > 0 && s->pipe_noshared) {
+                return s->pipe_noshared;
+            }
+            if (g_coalesced > 0 && s->pipe_coal) {
+                return s->pipe_coal;
+            }
         }
     }
     return (type == GGML_T_F32) ? s->pipe_f32 : s->pipe_q;
@@ -1058,8 +1061,8 @@ static void vk_matmul(void *self, uint32_t type, const uint8_t *w, uint64_t wkey
         return;
     }
 
-    if (type != GGML_T_F32 && type != GGML_T_Q4_K &&
-        type != GGML_T_Q5_K && type != GGML_T_Q6_K) {
+    if (type != GGML_T_F32 && type != GGML_T_Q2_K && type != GGML_T_Q3_K &&
+        type != GGML_T_Q4_K && type != GGML_T_Q5_K && type != GGML_T_Q6_K) {
         fallback_matmul(type, w, ne0, ne1, x, y);
         return;
     }
@@ -1155,8 +1158,8 @@ static void vk_matmul_batch(void *self, uint32_t type, const uint8_t *w,
     vk_state_t *s = (vk_state_t *)self;
 
     if (!s || n_tokens <= 0 || vk_init(s) != 0 || wkey == 0 ||
-        (type != GGML_T_F32 && type != GGML_T_Q4_K &&
-         type != GGML_T_Q5_K && type != GGML_T_Q6_K) ||
+        (type != GGML_T_F32 && type != GGML_T_Q2_K && type != GGML_T_Q3_K &&
+         type != GGML_T_Q4_K && type != GGML_T_Q5_K && type != GGML_T_Q6_K) ||
         (type != GGML_T_F32 && ne0 % 256 != 0) ||
         ne0 > VK_X_MAX ||
         (uint64_t)n_tokens * ne0 * 4 > VK_BXSTRIDE ||
@@ -1232,7 +1235,8 @@ static void vk_matmul_batch(void *self, uint32_t type, const uint8_t *w,
 
     static int g_use_gemm = -1;
     if (g_use_gemm < 0) g_use_gemm = getenv("MOE_VK_GEMM") != NULL;
-    if (g_use_gemm && n_tokens > 1 && type != GGML_T_F32) {
+    if (g_use_gemm && n_tokens > 1 &&
+        (type == GGML_T_Q4_K || type == GGML_T_Q5_K || type == GGML_T_Q6_K)) {
         struct {
             uint32_t ne0, ne1, type, n_tokens, x_off, y_off;
         } pc = { (uint32_t)ne0, (uint32_t)ne1, type, (uint32_t)n_tokens, 0, 0 };

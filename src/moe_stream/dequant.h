@@ -17,6 +17,8 @@
 enum {
     GGML_T_F32  = 0,
     GGML_T_F16  = 1,
+    GGML_T_Q2_K = 10,
+    GGML_T_Q3_K = 11,
     GGML_T_Q4_K = 12,
     GGML_T_Q5_K = 13,
     GGML_T_Q6_K = 14,

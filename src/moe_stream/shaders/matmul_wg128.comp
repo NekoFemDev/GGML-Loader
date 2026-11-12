@@ -217,6 +217,117 @@ float dot_q6k(uint rowbase, uint xbase)
     return acc;
 }
 
+
+// q2_K: 84 B = scales[16], qs[64], f16 d, f16 dmin
+float dot_q2k(uint rowbase, uint xbase)
+{
+    float acc = 0.0;
+    uint  nb  = pc.ne0 / 256u;
+
+    for (uint b = 0u; b < nb; ++b) {
+        uint  off  = rowbase + b * 84u;
+        float d    = f16At(off + 80u);
+        float dmin = f16At(off + 82u);
+        uint  sc   = off;
+        uint  q    = off + 16u;
+        uint  is   = 0u;
+        uint  xi   = xbase + b * 256u;
+
+        for (uint n = 0u; n < 2u; ++n) {
+            uint shift = 0u;
+            for (uint j = 0u; j < 4u; ++j) {
+                uint s = byteAt(sc + is); is++;
+                float dl = d * float(s & 0x0Fu);
+                float ml = dmin * float(s >> 4u);
+                for (uint l = 0u; l < 16u; ++l) {
+                    acc += (dl * float((byteAt(q + l) >> shift) & 3u) - ml)
+                         * xs[xi + n * 128u + j * 32u + l];
+                }
+                s = byteAt(sc + is); is++;
+                dl = d * float(s & 0x0Fu);
+                ml = dmin * float(s >> 4u);
+                for (uint l = 0u; l < 16u; ++l) {
+                    acc += (dl * float((byteAt(q + l + 16u) >> shift) & 3u) - ml)
+                         * xs[xi + n * 128u + j * 32u + 16u + l];
+                }
+                shift += 2u;
+            }
+            q += 32u;
+        }
+    }
+    return acc;
+}
+
+// q3_K: 110 B = hmask[32], qs[64], scales[12], f16 d
+float dot_q3k(uint rowbase, uint xbase)
+{
+    const uint kmask1 = 0x03030303u;
+    const uint kmask2 = 0x0f0f0f0fu;
+
+    float acc = 0.0;
+    uint  nb  = pc.ne0 / 256u;
+
+    for (uint b = 0u; b < nb; ++b) {
+        uint  off  = rowbase + b * 110u;
+        uint  hm   = off;
+        uint  q    = off + 32u;
+        float dall = f16At(off + 108u);
+        uint  xi   = xbase + b * 256u;
+
+        uint s0 = u32At(off + 96u);
+        uint s1 = u32At(off + 100u);
+        uint s2 = u32At(off + 104u);
+        uint tmp = s2;
+
+        uint a0, a1, a2, a3;
+        a2 = ((s0 >> 4u) & kmask2) | (((tmp >> 4u) & kmask1) << 4u);
+        a3 = ((s1 >> 4u) & kmask2) | (((tmp >> 6u) & kmask1) << 4u);
+        a0 = (s0 & kmask2) | (((tmp >> 0u) & kmask1) << 4u);
+        a1 = (s1 & kmask2) | (((tmp >> 2u) & kmask1) << 4u);
+
+        uint  m  = 1u;
+        uint  is = 0u;
+
+        for (uint n = 0u; n < 2u; ++n) {
+            uint shift = 0u;
+            for (uint j = 0u; j < 4u; ++j) {
+                uint sb = 0u;
+                uint idx = is;
+                if (idx < 4u)      sb = (a0 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else if (idx < 8u) sb = (a1 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else if (idx < 12u) sb = (a2 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else               sb = (a3 >> ((idx & 3u) * 8u)) & 0xFFu;
+                float dl = dall * float(int(sb) - 32);
+                is++;
+
+                for (uint l = 0u; l < 16u; ++l) {
+                    int qv = int((byteAt(q + l) >> shift) & 3u);
+                    int hv = (byteAt(hm + l) & m) != 0u ? 0 : 4;
+                    acc += dl * float(qv - hv) * xs[xi + n * 128u + j * 32u + l];
+                }
+
+                idx = is;
+                if (idx < 4u)      sb = (a0 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else if (idx < 8u) sb = (a1 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else if (idx < 12u) sb = (a2 >> ((idx & 3u) * 8u)) & 0xFFu;
+                else               sb = (a3 >> ((idx & 3u) * 8u)) & 0xFFu;
+                dl = dall * float(int(sb) - 32);
+                is++;
+
+                for (uint l = 0u; l < 16u; ++l) {
+                    int qv = int((byteAt(q + l + 16u) >> shift) & 3u);
+                    int hv = (byteAt(hm + l + 16u) & m) != 0u ? 0 : 4;
+                    acc += dl * float(qv - hv) * xs[xi + n * 128u + j * 32u + 16u + l];
+                }
+                shift += 2u;
+                m <<= 1u;
+            }
+            q += 32u;
+        }
+    }
+    return acc;
+}
+
 void main()
 {
     for (uint i = gl_LocalInvocationID.x; i < pc.ne0; i += 128u) {
@@ -229,12 +340,19 @@ void main()
         return;
     }
 
-    uint block_bytes = pc.type == 12u ? 144u : (pc.type == 13u ? 176u : 210u);
+    uint block_bytes = pc.type == 10u ? 84u
+                     : pc.type == 11u ? 110u
+                     : pc.type == 12u ? 144u
+                     : pc.type == 13u ? 176u : 210u;
     uint row_bytes   = (pc.ne0 / 256u) * block_bytes;
     uint rb          = row * row_bytes;
 
     float acc;
-    if (pc.type == 12u) {
+    if (pc.type == 10u) {
+        acc = dot_q2k(rb, 0u);
+    } else if (pc.type == 11u) {
+        acc = dot_q3k(rb, 0u);
+    } else if (pc.type == 12u) {
         acc = dot_q4k(rb, 0u);
     } else if (pc.type == 13u) {
         acc = dot_q5k(rb, 0u);
